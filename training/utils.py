@@ -50,6 +50,32 @@ def maybe_load_checkpoint(model_engine, checkpoint_path: str) -> None:
         model_engine.module.load_state_dict(state, strict=False)
 
 
+def save_hf_checkpoint(model_engine, tokenizer, output_dir: str) -> None:
+    """Save a HuggingFace-compatible checkpoint from a DeepSpeed engine.
+
+    This exports the model weights and config via PreTrainedModel.save_pretrained
+    and writes tokenizer files so serving frameworks (vLLM/OpenCompass) can load.
+    """
+    ensure_dir(output_dir)
+    # Only rank 0 writes to disk
+    try:
+        import deepspeed
+        is_rank0 = (deepspeed.comm.get_rank() == 0)
+    except Exception:
+        is_rank0 = True
+    if not is_rank0:
+        return
+    model = model_engine.module
+    # Some PreTrainedModel subclasses need to be on CPU to save comfortably
+    model_to_save = model
+    model_to_save.save_pretrained(output_dir)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output_dir)
+
+
+__all__ += ["save_hf_checkpoint"]
+
+
 __all__ = [
     "load_json",
     "load_yaml",

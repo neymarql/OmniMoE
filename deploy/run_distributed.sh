@@ -10,6 +10,13 @@ OUTPUT_DIR=${OUTPUT_DIR:-/mnt/checkpoints/omni_stack_moe}
 
 mkdir -p "${OUTPUT_DIR}"
 
+# Encourage Expert-Parallel grouping per node (8 GPUs)
+export DEEPSPEED_MOE_GROUP=${DEEPSPEED_MOE_GROUP:-8}
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-8}
+export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-2}
+
 deepspeed --num_nodes "${NNODES}" \
   --num_gpus "${GPUS_PER_NODE}" \
   --master_addr "${MASTER_ADDR}" \

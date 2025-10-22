@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from transformers import PreTrainedModel, PretrainedConfig
 
 from .llm_qwen import QwenMoELLM
@@ -63,17 +64,15 @@ class OmniMoEModel(PreTrainedModel):
             min_capacity=router_common.get("min_capacity", 4),
             drop_tokens=router_common.get("token_drop", False),
             noisy_gate_policy=router_common.get("noisy_gate_policy", "Jitter"),
+            use_mid_tokens=vision_moe.get("use_mid_tokens", True),
+            mid_layer_index=vision_moe.get("mid_layer_index", -4),
+            use_shared_expert=vision_moe.get("use_shared_expert", True),
+            shared_expert_scale=vision_moe.get("shared_expert_scale", 0.1),
+            use_megablocks_dropless=bool(self.config.router_cfg.get("use_megablocks_dropless", False)),
         )
         self.vision_hidden = self.vision.hidden_size
 
-        self.projector = ProjectorBridge(
-            hidden_size=projector_cfg.get("hidden_size", self.vision_hidden),
-            num_queries=projector_cfg.get("num_queries", 32),
-            num_layers=projector_cfg.get("num_layers", 2),
-            num_heads=projector_cfg.get("num_heads", 8),
-            num_experts=projector_cfg.get("num_experts", 8),
-        )
-
+        attn_impl = self.config.precision_cfg.get("flash_attention_impl", "flash_attention_2")
         self.qwen = QwenMoELLM(
             model_name_or_path=config.llm_model_name,
             moe_layers=text_moe.get("moe_layers", []),
@@ -84,15 +83,36 @@ class OmniMoEModel(PreTrainedModel):
             min_capacity=router_common.get("min_capacity", 4),
             drop_tokens=router_common.get("token_drop", False),
             noisy_gate_policy=router_common.get("noisy_gate_policy", "Jitter"),
+            use_shared_expert=text_moe.get("use_shared_expert", True),
+            shared_expert_scale=text_moe.get("shared_expert_scale", 0.1),
+            attn_implementation=attn_impl,
+            use_megablocks_dropless=bool(self.config.router_cfg.get("use_megablocks_dropless", False)),
         )
         self.llm = self.qwen.model
         self.tokenizer = self.qwen.tokenizer
+
+        self.projector = ProjectorBridge(
+            hidden_size=projector_cfg.get("hidden_size", self.llm.config.hidden_size),
+            num_queries=projector_cfg.get("num_queries", 32),
+            num_layers=projector_cfg.get("num_layers", 2),
+            num_heads=projector_cfg.get("num_heads", 8),
+            num_experts=projector_cfg.get("num_experts", 8),
+            ec_routing=projector_cfg.get("ec_routing", False),
+            capacity_factor=self.config.router_cfg.get("capacity_factor", 1.25),
+        )
         image_token = config.alignment_cfg.get("image_token", "<image>")
         if image_token not in self.tokenizer.get_vocab():
             self.tokenizer.add_tokens([image_token])
             self.llm.resize_token_embeddings(len(self.tokenizer))
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(image_token)
-        self.aux_loss_coef = router_common.get("aux_loss_coef", 0.01)
+        aux_map = config.router_cfg.get("aux_loss_coefs", {})
+        self.aux_coef_text = float(aux_map.get("text_moe", router_common.get("aux_loss_coef", 0.01)))
+        self.aux_coef_vision = float(aux_map.get("vision_moe", router_common.get("aux_loss_coef", 0.01)))
+        self.aux_coef_projector = float(aux_map.get("projector_moe", router_common.get("aux_loss_coef", 0.01)))
+        self.global_balance_coefs = {
+            "text": float(config.router_cfg.get("global_balance_coef", {}).get("text_moe", 0.0)),
+            "vision": float(config.router_cfg.get("global_balance_coef", {}).get("vision_moe", 0.0)),
+        }
         self.num_projected_tokens = projector_cfg.get("num_queries", 32)
 
     def get_input_embeddings(self) -> nn.Module:  # noqa: D401
@@ -167,14 +187,26 @@ class OmniMoEModel(PreTrainedModel):
         text_embeds = self.get_input_embeddings()(text_ids)
 
         if pixel_values is not None:
-            vision_outputs = self.vision(pixel_values)
+            vis = self.vision(pixel_values)
+            if isinstance(vis, dict):
+                last_tokens = vis.get("last_hidden")
+                mid_tokens = vis.get("mid_hidden")
+                cls_vec = vis.get("cls")
+                if mid_tokens is not None:
+                    image_embeddings = torch.cat([mid_tokens, last_tokens], dim=1)
+                else:
+                    image_embeddings = last_tokens
+            else:
+                image_embeddings = vis
+                cls_vec = image_embeddings.mean(dim=1)
         else:
-            vision_outputs = torch.zeros(
+            image_embeddings = torch.zeros(
                 (input_ids.size(0), 1, self.vision_hidden), device=device, dtype=text_embeds.dtype
             )
+            cls_vec = image_embeddings.mean(dim=1)
         image_mask_tokens = image_mask.unsqueeze(1).float()
         projected_tokens = self.projector(
-            image_embeddings=vision_outputs,
+            image_embeddings=image_embeddings,
             text_embeddings=text_embeds,
             image_mask=image_mask_tokens,
         )
@@ -203,11 +235,69 @@ class OmniMoEModel(PreTrainedModel):
             labels=augmented_labels,
             **kwargs,
         )
-
+        # Aggregate auxiliary MoE losses
+        total_aux = torch.tensor(0.0, device=outputs.logits.device)
+        # Projector custom aux
+        proj_aux = self.projector.aux_loss().to(outputs.logits.device)
+        total_aux = total_aux + self.aux_coef_projector * proj_aux
+        # DeepSpeed MoE aux from text/vision layers
+        for m in self.modules():
+            if hasattr(m, "_last_aux_loss") and getattr(m, "_last_aux_loss") is not None:
+                coef = self.aux_coef_text if getattr(m, "_moe_scope", None) == "text" else (
+                    self.aux_coef_vision if getattr(m, "_moe_scope", None) == "vision" else 0.0
+                )
+                if coef > 0:
+                    total_aux = total_aux + coef * m._last_aux_loss.to(outputs.logits.device)
+                m._last_aux_loss = None
+        # Global load-balance penalty based on expert counts
+        for m in self.modules():
+            counts = getattr(m, "_last_expert_counts", None)
+            if counts is None:
+                continue
+            counts = counts.to(outputs.logits.device, dtype=torch.float32)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            total = counts.sum().clamp(min=1.0)
+            probs = counts / total
+            num_e = probs.numel()
+            if num_e > 0:
+                target = 1.0 / num_e
+                imbalance = torch.sum((probs - target) ** 2)
+                scope = getattr(m, "_moe_scope", None)
+                coef = self.global_balance_coefs.get(scope, 0.0)
+                if coef > 0:
+                    total_aux = total_aux + coef * imbalance
+            m._last_expert_counts = None
+        # Secondary EMA-based balance (more stable across steps)
+        for m in self.modules():
+            ema_counts = getattr(m, "_ema_expert_counts", None)
+            if ema_counts is None:
+                continue
+            counts = ema_counts.to(outputs.logits.device, dtype=torch.float32)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            total = counts.sum().clamp(min=1.0)
+            probs = counts / total
+            num_e = probs.numel()
+            if num_e > 0:
+                target = 1.0 / num_e
+                imbalance = torch.sum((probs - target) ** 2)
+                scope = getattr(m, "_moe_scope", None)
+                coef = self.global_balance_coefs.get(scope, 0.0) * 0.5
+                if coef > 0:
+                    total_aux = total_aux + coef * imbalance
         if augmented_labels is not None:
-            aux_loss = self.projector.aux_loss().to(outputs.logits.device)
-            outputs.loss = outputs.loss + self.aux_loss_coef * aux_loss
+            outputs.loss = outputs.loss + total_aux
         return outputs
+
+    def set_projector_active_layers(self, n: int) -> None:
+        self.projector.set_active_layers(n)
+
+    def set_projector_router_temperature(self, temperature: float) -> None:
+        self.projector.set_router_temperature(temperature)
+
+    def set_projector_router_jitter(self, std: float) -> None:
+        self.projector.set_router_jitter(std)
 
     def configure_optimizer_param_groups(self) -> Any:
         if split_params_into_different_moe_groups_for_optimizer is None:

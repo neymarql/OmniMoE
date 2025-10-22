@@ -1,23 +1,41 @@
-stage1:
+warmup:
   epochs: 1
-  learning_rate: 2.0e-05
-  warmup_steps: 2000
-  max_steps: 12000
-  mixer: topk
-stage2:
+  learning_rate: 2.0e-04
+  warmup_steps: 500
+  max_steps: 5000
+  router_temperature: { start: 1.5, end: 1.1, steps: 5000 }
+  router_jitter_std: 0.02
+  freeze:
+    llm: ["all"]
+    vision: ["all_but_moe"]
+    projector: []
+  projector_layers: 2
+align:
   epochs: 1
-  learning_rate: 1.5e-05
+  learning_rate: 1.0e-04
   warmup_steps: 1000
   max_steps: 12000
-  mixer: topk
-stage3:
-  epochs: 1
-  learning_rate: 1.0e-05
+  router_temperature: { start: 1.1, end: 1.0, steps: 12000 }
+  router_jitter_std: 0.01
+  freeze:
+    llm: ["bottom_24"]
+    vision: ["first_half"]
+    projector: []
+  projector_layers: 3
+reasoning:
+  epochs: 2
+  learning_rate: 5.0e-05
   warmup_steps: 500
-  max_steps: 8000
-  mixer: topk
+  max_steps: 6000
+  router_temperature: { start: 1.0, end: 1.0, steps: 6000 }
+  router_jitter_std: 0.0
+  freeze:
+    llm: []
+    vision: []
+    projector: []
+  projector_layers: 4
 curriculum:
-  order: ["stage1", "stage2", "stage3"]
+  order: ["warmup", "align", "reasoning"]
   eval_interval_steps: 2000
   checkpoint_interval_steps: 1000
   gradient_accumulation_steps: 8
@@ -34,3 +52,7 @@ global:
   gradient_checkpointing: true
   resume_from: ""
   output_dir: "/mnt/checkpoints/omni_stack_moe"
+  aux_loss_coef:
+    text_moe: 0.02
+    vision_moe: 0.03
+    projector_moe: 0.05

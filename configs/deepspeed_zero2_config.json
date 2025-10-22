@@ -7,14 +7,8 @@
   "gradient_clipping": 1.0,
   "zero_optimization": {
     "stage": 2,
-    "offload_param": {
-      "device": "cpu",
-      "pin_memory": true
-    },
-    "offload_optimizer": {
-      "device": "cpu",
-      "pin_memory": true
-    },
+    "offload_param": { "device": "none" },
+    "offload_optimizer": { "device": "none" },
     "contiguous_gradients": true,
     "overlap_comm": true,
     "reduce_scatter": true,
@@ -22,9 +16,7 @@
     "allgather_bucket_size": 1500000000,
     "reduce_bucket_size": 1500000000
   },
-  "bf16": {
-    "enabled": true
-  },
+  "bf16": { "enabled": true },
   "activation_checkpointing": {
     "partition_activations": true,
     "cpu_checkpointing": false,
@@ -36,10 +28,7 @@
     "type": "AdamW",
     "params": {
       "lr": 0.00002,
-      "betas": [
-        0.9,
-        0.95
-      ],
+      "betas": [0.9, 0.95],
       "eps": 1e-08,
       "weight_decay": 0.01
     }
@@ -53,21 +42,5 @@
       "total_num_steps": 500000
     }
   },
-  "moe": {
-    "enabled": true,
-    "expert_parallel_size": 8,
-    "moe_param_group": true,
-    "router_topk": 1,
-    "min_capacity": 4,
-    "capacity_factor": 1.25,
-    "aux_loss_coef": 0.01,
-    "drop_tokens": false,
-    "noisy_gate_policy": "Jitter",
-    "use_tutel": true,
-    "enable_expert_tensor_parallelism": false
-  },
-  "tensorboard": {
-    "enabled": true,
-    "output_path": "./runs"
-  }
+  "tensorboard": { "enabled": true, "output_path": "./runs" }
 }

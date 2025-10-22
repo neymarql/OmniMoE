@@ -41,6 +41,7 @@ class ConversationDataset(Dataset):
         cache_prompts: bool = True,
     ) -> None:
         if not os.path.isfile(json_path):
+            print(f"[Dataset][ERROR] Manifest not found: {json_path}")
             raise FileNotFoundError(f"Dataset manifest not found: {json_path}")
         self.json_path = json_path
         self.image_folder = image_folder.rstrip("/")
@@ -63,6 +64,7 @@ class ConversationDataset(Dataset):
         with open(json_path, "r", encoding="utf-8") as fp:
             data = json.load(fp)
         if not isinstance(data, list):
+            print(f"[Dataset][ERROR] Expected list in {json_path}, got {type(data)}")
             raise ValueError(f"Expected list in {json_path}, got {type(data)}")
         self.records = data
         print(f"[ConversationDataset] Loaded {len(self.records):,} samples from {json_path}")
@@ -121,7 +123,7 @@ class ConversationDataset(Dataset):
         image_rel_path = image_list[0]
         full_path = os.path.join(self.image_folder, image_rel_path)
         if not os.path.isfile(full_path):
-            print(f"[ConversationDataset] Warning: missing image {full_path}, substituting blank tensor")
+            print(f"[Dataset][WARN] Missing image {full_path}, substituting blank tensor")
             return blank
         with Image.open(full_path) as img:
             image = img.convert("RGB")

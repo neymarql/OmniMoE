@@ -23,9 +23,16 @@ class QwenMoELLM(nn.Module):
         min_capacity: int = 4,
         drop_tokens: bool = False,
         noisy_gate_policy: str = "Jitter",
+        use_shared_expert: bool = True,
+        shared_expert_scale: float = 0.1,
+        attn_implementation: str = "flash_attention_2",
+        use_megablocks_dropless: bool = False,
     ) -> None:
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, attn_implementation="flash_attention_2")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            attn_implementation=attn_implementation,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
@@ -48,6 +55,10 @@ class QwenMoELLM(nn.Module):
                 min_capacity=min_capacity,
                 drop_tokens=drop_tokens,
                 noisy_gate_policy=noisy_gate_policy,
+                scope="text",
+                use_shared_expert=use_shared_expert,
+                shared_expert_scale=shared_expert_scale,
+                use_megablocks_dropless=use_megablocks_dropless,
             )
             self._inject_ffn(block, moe_ffn)
             del ffn_module

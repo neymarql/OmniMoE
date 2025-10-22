@@ -1,6 +1,6 @@
 {
   "llm_model_name": "Qwen/Qwen3-8B",
-  "vision_model_name": "google/siglip-large-patch16-384",
+  "vision_model_name": "google/siglip2-base-patch16-224",
   "tokenizer_name": "Qwen/Qwen3-8B",
   "max_text_length": 4096,
   "projector": {
@@ -8,11 +8,12 @@
     "num_layers": 4,
     "num_heads": 16,
     "num_experts": 8,
-    "hidden_size": 1536
+    "hidden_size": 4096,
+    "ec_routing": false
   },
   "text_moe": {
     "num_experts": 16,
-    "router_top_k": 1,
+    "router_top_k": 2,
     "expert_intermediate_mult": 4,
     "moe_layers": [
       12,
@@ -28,20 +29,29 @@
       34,
       35
     ],
-    "ep_size": 8
+    "ep_size": 8,
+    "use_shared_expert": true,
+    "shared_expert_scale": 0.1
   },
   "vision_moe": {
     "num_experts": 8,
-    "router_top_k": 1,
+    "router_top_k": 2,
     "back_k_layers": 4,
-    "ep_size": 8
+    "ep_size": 8,
+    "use_mid_tokens": true,
+    "mid_layer_index": -4,
+    "use_shared_expert": true,
+    "shared_expert_scale": 0.1
   },
   "router": {
     "noisy_gate_policy": "Jitter",
     "capacity_factor": 1.25,
     "min_capacity": 4,
     "aux_loss_coef": 0.01,
-    "token_drop": false
+    "aux_loss_coefs": {"text_moe": 0.02, "vision_moe": 0.03, "projector_moe": 0.05},
+    "token_drop": false,
+    "global_balance_coef": {"text_moe": 0.002, "vision_moe": 0.003},
+    "use_megablocks_dropless": false
   },
   "alignment": {
     "image_token": "<image>",
@@ -51,6 +61,7 @@
   },
   "precision": {
     "bf16": true,
-    "fp16": false
+    "fp16": false,
+    "flash_attention_impl": "flash_attention_2"
   }
 }

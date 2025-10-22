@@ -528,6 +528,11 @@ If you share (a) node/GPU count & interconnect, (b) target hidden size/LLM depth
   - `deepspeed_zero2_config.json` – ZeRO stage-2 with CPU offload and MoE options aligned to DeepSpeed 0.18.
   - `train_hyperparams.yaml` – curriculum order, stage LR scheduling, logging/checkpoint cadence.
   - `cluster_config.yaml` – NCCL and launcher hints for Slurm/NVL72 deployments.
+- Key architectural features:
+  - Top-2 sparse routing across text/vision/projector MoE layers with per-scope auxiliary and global load-balancing losses.
+  - Shared “always-on” expert residual paths for stability, configurable per scope in `omni_moe_config.json`.
+  - Multi-scale SigLIP2 vision tokens (mid + final layers + CLS) fed into the DeepStack-style projector with stage-tunable depth.
+  - Stage-aware parameter freezing/unfreezing and optimizer reinitialisation via `train_hyperparams.yaml`.
 - `data/`
   - `dataset.py` – weighted multi-source JSON loader with SigLIP transforms and dialogue tokenization.
   - `collate.py` – padding, label masking, and image tensor batching aware of per-sample pad ids.
@@ -552,6 +557,8 @@ If you share (a) node/GPU count & interconnect, (b) target hidden size/LLM depth
 - `evaluation/`
   - `evaluate_vqa.py`, `evaluate_captioning.py`, `evaluate_nlp.py` – task-specific harnesses with EM/BLEU metrics.
   - `metrics.py` – shared scoring utilities.
+  - `opencompass/omni_moe_adapter.py` – OpenCompass adapter to load OmniMoE and evaluate on multimodal tasks.
+  - `vlmevalkit_adapter.py` – VLMEvalKit bridge exposing a predict(image, question) method.
 - `requirements.txt` – minimal runtime dependencies (DeepSpeed, Transformers, vLLM, FastAPI).
 
 ### Quickstart
@@ -576,6 +583,9 @@ python OmniMoE/evaluation/evaluate_vqa.py \
   --config OmniMoE/configs/omni_moe_config.json \
   --dataset /data/vqa/val.json
 ```
+
+OpenCompass (example): see `evaluation/opencompass/omni_moe_adapter.py` and configure a run file to point at your checkpoints.
+VLMEvalKit (example): import `OmniMoEVLMEval` from `evaluation/vlmevalkit_adapter.py` and register it in your VLMEvalKit model zoo.
 
 For high-throughput serving, export the HF-style checkpoint produced in `output_dir/final` and load it with vLLM:
 

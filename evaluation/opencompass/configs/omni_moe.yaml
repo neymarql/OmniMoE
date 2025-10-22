@@ -1,0 +1,29 @@
+models:
+  - name: OmniMoE
+    type: custom
+    # Path to a HF-exported checkpoint directory (saved by trainer)
+    path: ${MODEL_DIR}
+    adapter: OmniMoECompassModel
+    adapter_args:
+      config_path: ${CONFIG_PATH}
+      device: cuda
+
+datasets:
+  - name: COCOCaption
+    task: caption
+  - name: VQAv2
+    task: vqa
+  - name: ScienceQA
+    task: vqa
+  - name: FigureQA
+    task: vqa
+  - name: MMBench-Lite
+    task: mmbench
+
+inference:
+  max_new_tokens: 64
+  batch_size: 4
+  image_token: "<image>"
+
+# Note: This YAML expects OpenCompass to map dataset names to its internal
+# dataset registry. The adapter lives at evaluation/opencompass/omni_moe_adapter.py.

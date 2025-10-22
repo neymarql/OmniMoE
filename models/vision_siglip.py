@@ -24,6 +24,11 @@ class SiglipVisionWithMoE(nn.Module):
         min_capacity: int = 4,
         drop_tokens: bool = False,
         noisy_gate_policy: str = "Jitter",
+        use_mid_tokens: bool = True,
+        mid_layer_index: int = -4,
+        use_shared_expert: bool = True,
+        shared_expert_scale: float = 0.1,
+        use_megablocks_dropless: bool = False,
     ) -> None:
         super().__init__()
         self.model = SiglipVisionModel.from_pretrained(model_name_or_path)
@@ -31,6 +36,8 @@ class SiglipVisionWithMoE(nn.Module):
         self.hidden_size = self.model.config.hidden_size
         self.intermediate_size = self.model.config.intermediate_size
         self.num_layers = self.model.config.num_hidden_layers
+        self.use_mid_tokens = use_mid_tokens
+        self.mid_layer_index = mid_layer_index
 
         if back_k_layers <= 0 or back_k_layers > self.num_layers:
             raise ValueError("back_k_layers must be between 1 and num_hidden_layers")
@@ -50,6 +57,10 @@ class SiglipVisionWithMoE(nn.Module):
                 min_capacity=min_capacity,
                 drop_tokens=drop_tokens,
                 noisy_gate_policy=noisy_gate_policy,
+                scope="vision",
+                use_shared_expert=use_shared_expert,
+                shared_expert_scale=shared_expert_scale,
+                use_megablocks_dropless=use_megablocks_dropless,
             )
             self._inject_mlp(layer, moe_ffn)
             del ffn
@@ -92,9 +103,20 @@ class SiglipVisionWithMoE(nn.Module):
             return
         raise AttributeError("Unable to inject MoE FFN into SigLIP block")
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        outputs = self.model(pixel_values=pixel_values, output_hidden_states=False)
-        return outputs.last_hidden_state
+    def forward(self, pixel_values: torch.Tensor):
+        outputs = self.model(pixel_values=pixel_values, output_hidden_states=self.use_mid_tokens)
+        last_hidden = outputs.last_hidden_state
+        result = {"last_hidden": last_hidden}
+        if self.use_mid_tokens and hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            idx = self.mid_layer_index if self.mid_layer_index < 0 else self.mid_layer_index
+            mid = outputs.hidden_states[idx]
+            result["mid_hidden"] = mid
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            result["cls"] = outputs.pooler_output
+        else:
+            # fallback: mean pool
+            result["cls"] = last_hidden.mean(dim=1)
+        return result
 
 
 __all__ = ["SiglipVisionWithMoE"]
