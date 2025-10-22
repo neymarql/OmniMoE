@@ -1,0 +1,99 @@
+{
+  "stage1": {
+    "data_sources": [
+      {
+        "data_path": ["/mnt//qianlong/datasets/train_json/llava_image_.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/llava_image_tune_.json"],
+        "image_folder": "/home/qianlong/datasets",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/la_tune_256k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/svit_tune_157k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/lrv_tune_331k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/lvis_tune_220k_.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/nlp_tune.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      }
+    ]
+  },
+  "stage2": {
+    "data_sources": [
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/llava_image_.json"],
+        "image_folder": "/mnt/lustre/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/llava_image_tune_.json"],
+        "image_folder": "/mnt/lustre/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/la_tune_256k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/svit_tune_157k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/lrv_tune_331k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/lvis_tune_220k_.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      },
+      {
+        "data_path": ["/mnt/lustre/qianlong/datasets/train_json/nlp_tune.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      }
+    ]
+  },
+  "stage3": {
+    "data_sources": [
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/nlp_tune.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 1.0
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/llava_image_.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.8
+      },
+      {
+        "data_path": ["/home/qianlong/datasets/train_json/lrv_tune_331k.json"],
+        "image_folder": "/home/qianlong/datasets/",
+        "sample_rate": 0.5
+      }
+    ]
+  }
+}

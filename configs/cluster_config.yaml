@@ -1,0 +1,17 @@
+cluster:
+  launcher: slurm
+  partition: ai-gpu
+  qos: normal
+  nodes: 8
+  gpus_per_node: 8
+  cpus_per_task: 16
+  master_port: 29500
+  master_addr: 10.0.0.1
+  nnodes_env: SLURM_NNODES
+  node_rank_env: SLURM_NODEID
+nccl:
+  socket_ifname: "^lo,docker0"
+  min_nchannels: 8
+  debug: WARN
+  ib_disable: 0
+  net_gdr_level: 2

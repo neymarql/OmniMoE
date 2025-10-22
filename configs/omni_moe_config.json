@@ -1,0 +1,56 @@
+{
+  "llm_model_name": "Qwen/Qwen3-8B",
+  "vision_model_name": "google/siglip-large-patch16-384",
+  "tokenizer_name": "Qwen/Qwen3-8B",
+  "max_text_length": 4096,
+  "projector": {
+    "num_queries": 32,
+    "num_layers": 4,
+    "num_heads": 16,
+    "num_experts": 8,
+    "hidden_size": 1536
+  },
+  "text_moe": {
+    "num_experts": 16,
+    "router_top_k": 1,
+    "expert_intermediate_mult": 4,
+    "moe_layers": [
+      12,
+      13,
+      14,
+      15,
+      24,
+      25,
+      26,
+      27,
+      32,
+      33,
+      34,
+      35
+    ],
+    "ep_size": 8
+  },
+  "vision_moe": {
+    "num_experts": 8,
+    "router_top_k": 1,
+    "back_k_layers": 4,
+    "ep_size": 8
+  },
+  "router": {
+    "noisy_gate_policy": "Jitter",
+    "capacity_factor": 1.25,
+    "min_capacity": 4,
+    "aux_loss_coef": 0.01,
+    "token_drop": false
+  },
+  "alignment": {
+    "image_token": "<image>",
+    "image_token_dropout": 0.0,
+    "segment_size_text": 64,
+    "segment_size_image": 32
+  },
+  "precision": {
+    "bf16": true,
+    "fp16": false
+  }
+}
