@@ -31,7 +31,8 @@
     ],
     "ep_size": 8,
     "use_shared_expert": true,
-    "shared_expert_scale": 0.1
+    "shared_expert_scale": 0.1,
+    "use_expert_choice_router": false
   },
   "vision_moe": {
     "num_experts": 8,
@@ -41,7 +42,8 @@
     "use_mid_tokens": true,
     "mid_layer_index": -4,
     "use_shared_expert": true,
-    "shared_expert_scale": 0.1
+    "shared_expert_scale": 0.1,
+    "use_expert_choice_router": false
   },
   "router": {
     "noisy_gate_policy": "Jitter",
@@ -62,6 +64,6 @@
   "precision": {
     "bf16": true,
     "fp16": false,
-    "flash_attention_impl": "flash_attention_2"
+    "flash_attention_impl": "flash_attention_3"
   }
 }

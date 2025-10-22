@@ -20,9 +20,9 @@ Below is a sanity‑check + upgrade of your blueprint to be correct and current 
 
 5. Dispatcher/All‑to‑All: In PyTorch, use `dist.all_to_all_single(send, recv, input_split_sizes, output_split_sizes, group=ep_group)` properly with a prior count exchange to compute `recv_splits`; don’t reuse the same buffer for send/recv. (Var‑sized all‑to‑all is supported, but mind known deadlock pitfalls; production stacks use fused dispatchers.) ([PyTorch Docs][6])
 
-6. Routing/load‑balance: The Switch Transformer auxiliary loss (importance × load) and Noisy Top‑k remain the robust defaults; Expert‑Choice routing (EC) is a modern alternative used in some recent MoE lines (e.g., DeepSeek V2‑series). Start with Top‑2 + Switch aux loss unless you need EC’s properties. ([arXiv][7])
+6. Routing/load‑balance: The Switch Transformer auxiliary loss (importance × load) and Noisy Top‑k remain the robust defaults; Expert‑Choice routing (EC) is a modern alternative used in some recent MoE lines (e.g., DeepSeek V2‑series). Start with Top‑2 + Switch aux loss unless you need EC’s properties. You can toggle EC per branch via `text_moe.use_expert_choice_router` / `vision_moe.use_expert_choice_router`, which activates the expert-driven dispatcher with capacity-aware token selection, balanced importance/load EMA, and zero-drop fallback. ([arXiv][7])
 
-7. Optional accelerators: Tutel (Microsoft) remains a drop‑in MoE optimization, and MegaBlocks / “dropless” routing variants exist if you need zero‑drop or better tail behavior.
+7. Optional accelerators: Tutel (Microsoft) remains a drop‑in MoE optimization, and MegaBlocks / “dropless” routing variants exist if you need zero‑drop or better tail behavior (set `router.use_megablocks_dropless: true` **only after** installing MegaBlocks ≥0.7.0 on every node, e.g. `pip install megablocks`).
 
 Everything else in your blueprint is directionally correct.
 
@@ -363,7 +363,7 @@ Quantization: W8A16 / INT8/INT4 for attention/MLP; keep gate/routing in BF16/FP3
 ### 11) Monitoring & debugging (unchanged priorities)
 
 - Track: per‑expert token counts, gate entropy, aux loss, tokens dropped, A2A latency/bandwidth, expert GEMM time, pipeline bubble.
-- Use NVTX scopes around A2A and expert compute; profile with Nsight Systems. A2A > ~25–30% step time is a red flag (re‑place EP groups and/or increase capacity). (This matches both NVIDIA and DS guidance.) ([NVIDIA Developer][11])
+- Use NVTX scopes around A2A and expert compute; profile with Nsight Systems. A2A > ~25–30% step time is a red flag (re‑place EP groups and/or increase capacity). The trainer now emits `moe_ms`, `a2a_ms`, ratios, and call counts every `logging_steps`, and the TensorBoard run mirrors these scalars for long-term tracking. ([NVIDIA Developer][11])
 
 ---
 

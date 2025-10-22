@@ -27,12 +27,26 @@ class QwenMoELLM(nn.Module):
         shared_expert_scale: float = 0.1,
         attn_implementation: str = "flash_attention_2",
         use_megablocks_dropless: bool = False,
+        use_expert_choice_router: bool = False,
     ) -> None:
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            attn_implementation=attn_implementation,
-        )
+        self.attn_implementation = attn_implementation
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                attn_implementation=attn_implementation,
+            )
+        except Exception as err:
+            if attn_implementation == "flash_attention_3":
+                print(f"[QwenMoELLM][WARN] flash_attention_3 unavailable ({err}); falling back to flash_attention_2")
+                self.attn_implementation = "flash_attention_2"
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    attn_implementation="flash_attention_2",
+                )
+            else:
+                print(f"[QwenMoELLM][ERROR] Failed to load model with attention={attn_implementation}: {err}")
+                raise
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
@@ -59,6 +73,7 @@ class QwenMoELLM(nn.Module):
                 use_shared_expert=use_shared_expert,
                 shared_expert_scale=shared_expert_scale,
                 use_megablocks_dropless=use_megablocks_dropless,
+                use_expert_choice_router=use_expert_choice_router,
             )
             self._inject_ffn(block, moe_ffn)
             del ffn_module

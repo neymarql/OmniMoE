@@ -69,6 +69,7 @@ class OmniMoEModel(PreTrainedModel):
             use_shared_expert=vision_moe.get("use_shared_expert", True),
             shared_expert_scale=vision_moe.get("shared_expert_scale", 0.1),
             use_megablocks_dropless=bool(self.config.router_cfg.get("use_megablocks_dropless", False)),
+            use_expert_choice_router=vision_moe.get("use_expert_choice_router", False),
         )
         self.vision_hidden = self.vision.hidden_size
 
@@ -87,6 +88,7 @@ class OmniMoEModel(PreTrainedModel):
             shared_expert_scale=text_moe.get("shared_expert_scale", 0.1),
             attn_implementation=attn_impl,
             use_megablocks_dropless=bool(self.config.router_cfg.get("use_megablocks_dropless", False)),
+            use_expert_choice_router=text_moe.get("use_expert_choice_router", False),
         )
         self.llm = self.qwen.model
         self.tokenizer = self.qwen.tokenizer

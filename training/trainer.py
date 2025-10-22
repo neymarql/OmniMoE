@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, List
 
 import deepspeed
@@ -14,7 +15,14 @@ from OmniMoE.models.omni_model import OmniMoEConfig, OmniMoEModel
 from OmniMoE.training.scheduler import build_scheduler
 from OmniMoE.training.optim import build_optimizer
 from torch.utils.tensorboard import SummaryWriter
-from OmniMoE.training.utils import ensure_dir, maybe_load_checkpoint, set_seed, save_hf_checkpoint
+from OmniMoE.training.utils import (
+    ensure_dir,
+    maybe_load_checkpoint,
+    set_seed,
+    save_hf_checkpoint,
+    enable_all_to_all_monitor,
+    get_all_to_all_stats,
+)
 import subprocess
 
 
@@ -79,6 +87,14 @@ class CurriculumTrainer:
         except Exception as e:
             print(f"[Trainer][WARN] TensorBoard SummaryWriter unavailable: {e}")
             self.tb_writer = None
+        if torch.cuda.is_available():
+            self._step_start_event = torch.cuda.Event(enable_timing=True)
+            self._step_end_event = torch.cuda.Event(enable_timing=True)
+        else:
+            self._step_start_event = None
+            self._step_end_event = None
+        self._last_step_ms = 0.0
+        enable_all_to_all_monitor()
 
     def _build_dataloader(self, stage: str) -> DataLoader:
         stage_cfg = self.dataset_cfg[stage]
@@ -251,6 +267,8 @@ class CurriculumTrainer:
                         t = min(global_step, temp_steps)
                         cur_temp = temp_start + (temp_end - temp_start) * (t / max(1, temp_steps))
                         self.model.set_projector_router_temperature(cur_temp)
+                    if self._step_start_event is not None:
+                        self._step_start_event.record()
                     try:
                         outputs = self.model_engine(**batch)
                     except Exception as e:
@@ -260,12 +278,19 @@ class CurriculumTrainer:
                     self.model_engine.backward(loss)
                     self.model_engine.step()
                     scheduler.step()
+                    if self._step_end_event is not None:
+                        self._step_end_event.record()
                     global_step += 1
                     if global_step % self.hyperparams.get("global", {}).get("logging_steps", 50) == 0:
                         if deepspeed.comm.get_rank() == 0:
                             print(f"[Stage {stage}] step {global_step} loss={loss.item():.6f}")
                             # Log recent MoE aux losses summary
+                            if self._step_start_event is not None and self._step_end_event is not None:
+                                torch.cuda.synchronize()
+                                self._last_step_ms = float(self._step_start_event.elapsed_time(self._step_end_event))
+                            step_ms = self._last_step_ms
                             aux_text = aux_vis = 0.0
+                            moe_ms = 0.0
                             drop_text = drop_vis = 0.0
                             for m in self.model.modules():
                                 if hasattr(m, "_last_aux_loss") and getattr(m, "_last_aux_loss") is not None:
@@ -279,6 +304,8 @@ class CurriculumTrainer:
                                     d = float(getattr(m, "_last_drop_ratio"))
                                     if sc == "text": drop_text += d
                                     elif sc == "vision": drop_vis += d
+                                if hasattr(m, "_last_moe_forward_ms") and getattr(m, "_last_moe_forward_ms") is not None:
+                                    moe_ms += float(getattr(m, "_last_moe_forward_ms"))
                             aux_proj = float(self.model.projector.aux_loss().detach().cpu())
                             # Estimate projector router entropy
                             ent_vals = []
@@ -287,7 +314,25 @@ class CurriculumTrainer:
                                 if ent is not None:
                                     ent_vals.append(float(ent.detach().cpu()))
                             ent_avg = sum(ent_vals)/len(ent_vals) if ent_vals else 0.0
-                            print(f"  aux(text)={aux_text:.6f} aux(vision)={aux_vis:.6f} aux(projector)={aux_proj:.6f} ent(projector)={ent_avg:.6f} drop(text)={drop_text:.6f} drop(vision)={drop_vis:.6f}")
+                            moe_ratio = (moe_ms / step_ms) if step_ms > 0 else 0.0
+                            a2a_ms, a2a_calls = get_all_to_all_stats()
+                            a2a_ratio = (a2a_ms / step_ms) if step_ms > 0 else 0.0
+                            print(
+                                "  aux(text)={:.6f} aux(vision)={:.6f} aux(projector)={:.6f} ent(projector)={:.6f} drop(text)={:.6f} drop(vision)={:.6f} moe_ms={:.3f} step_ms={:.3f} moe_ratio={:.3f} a2a_ms={:.3f} a2a_ratio={:.3f} a2a_calls={:.0f}".format(
+                                    aux_text,
+                                    aux_vis,
+                                    aux_proj,
+                                    ent_avg,
+                                    drop_text,
+                                    drop_vis,
+                                    moe_ms,
+                                    step_ms,
+                                    moe_ratio,
+                                    a2a_ms,
+                                    a2a_ratio,
+                                    a2a_calls,
+                                )
+                            )
                             # TensorBoard scalars
                             if self.tb_writer is not None:
                                 self.tb_writer.add_scalar(f"{stage}/loss", float(loss.detach().cpu()), global_step)
@@ -297,6 +342,12 @@ class CurriculumTrainer:
                                 self.tb_writer.add_scalar(f"{stage}/proj_entropy", ent_avg, global_step)
                                 self.tb_writer.add_scalar(f"{stage}/drop_text", drop_text, global_step)
                                 self.tb_writer.add_scalar(f"{stage}/drop_vision", drop_vis, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/moe_ms", moe_ms, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/step_ms", step_ms, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/moe_ratio", moe_ratio, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/a2a_ms", a2a_ms, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/a2a_ratio", a2a_ratio, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/a2a_calls", a2a_calls, global_step)
                     # Periodic evaluation
                     self._maybe_eval(stage, global_step, stage_dir)
                     if global_step % self.hyperparams.get("global", {}).get("save_steps", 1000) == 0:

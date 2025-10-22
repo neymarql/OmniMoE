@@ -9,6 +9,7 @@ robust LLM MoE training at maximum efficiency.
 Requirements:
   - megatron-core >= 0.14
   - FlashAttention-3 kernels available (optional)
+    * enabled by default; pass `--disable-flash-attn-3` to fall back.
 
 Usage (example):
   torchrun --nproc_per_node 8 --nnodes 2 --node_rank $RANK \
@@ -19,7 +20,6 @@ Usage (example):
     --num-experts 16 \
     --moe-router-topk 2 \
     --sequence-parallel \
-    --use-flash-attn-3 \
     --train-iters 10000 \
     --micro-batch-size 2 \
     --global-batch-size 32 \
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-experts", type=int, default=16)
     p.add_argument("--moe-router-topk", type=int, default=2)
     p.add_argument("--sequence-parallel", action="store_true")
-    p.add_argument("--use-flash-attn-3", action="store_true")
+    p.add_argument("--disable-flash-attn-3", action="store_true")
     p.add_argument("--train-iters", type=int, default=1000)
     p.add_argument("--micro-batch-size", type=int, default=2)
     p.add_argument("--global-batch-size", type=int, default=32)
@@ -67,6 +67,7 @@ def main() -> None:
         raise
 
     args = parse_args()
+    args.use_flash_attn_3 = not args.disable_flash_attn_3
 
     # Initialize distributed and model-parallelism
     mcore.initialize.initialize_megatron(

@@ -29,6 +29,7 @@ class SiglipVisionWithMoE(nn.Module):
         use_shared_expert: bool = True,
         shared_expert_scale: float = 0.1,
         use_megablocks_dropless: bool = False,
+        use_expert_choice_router: bool = False,
     ) -> None:
         super().__init__()
         self.model = SiglipVisionModel.from_pretrained(model_name_or_path)
@@ -61,6 +62,7 @@ class SiglipVisionWithMoE(nn.Module):
                 use_shared_expert=use_shared_expert,
                 shared_expert_scale=shared_expert_scale,
                 use_megablocks_dropless=use_megablocks_dropless,
+                use_expert_choice_router=use_expert_choice_router,
             )
             self._inject_mlp(layer, moe_ffn)
             del ffn
