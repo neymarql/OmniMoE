@@ -9,12 +9,9 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-try:
-    from deepspeed.moe.layer import MoE as DeepSpeedMoE
-    from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
-except ModuleNotFoundError:  # pragma: no cover - fallback path
-    DeepSpeedMoE = None  # type: ignore
-    split_params_into_different_moe_groups_for_optimizer = None  # type: ignore
+from deepspeed.moe.layer import MoE as DeepSpeedMoE
+from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
+from .ep_dispatch import EpAllToAllDispatcher
 
 LOGGER = logging.getLogger(__name__)
 
@@ -65,17 +62,20 @@ class MoEFeedForward(nn.Module):
         self.router_top_k = router_top_k
         self.noisy_gate_policy = noisy_gate_policy
         self._router_noise_std = 0.01 if noisy_gate_policy.lower() == "jitter" else 0.0
+        self._router_temperature: float = 1.0
         self._moe_scope = scope
         self.use_shared_expert = use_shared_expert
         self.shared_expert_scale = shared_expert_scale
         self.shared_expert = ExpertFFN(hidden_size, ffn_dim) if use_shared_expert else None
         self.use_expert_choice = use_expert_choice_router
         self.use_megablocks = use_megablocks_dropless
+        # Backend selection establishes how EP is handled:
+        #  - "deepspeed": EP groups are managed internally by DeepSpeedMoE
+        #  - "expert_choice" / "megablocks": Python-side EP group is created
         self._backend = "expert_choice" if use_expert_choice_router else "deepspeed"
         self.num_local_experts = 0
         self._global_expert_offset = 0
         self._ep_group: Optional[dist.ProcessGroup] = None
-        self._ensure_ep_group()
 
         self.router: Optional[nn.Linear] = None
         self.local_experts: Optional[nn.ModuleList] = None
@@ -90,6 +90,17 @@ class MoEFeedForward(nn.Module):
                 drop_tokens=drop_tokens,
                 use_megablocks_dropless=use_megablocks_dropless,
             )
+
+        # EP group policy: only build Python-side EP group for expert_choice/megablocks.
+        if self._backend in {"expert_choice", "megablocks"}:
+            self._ensure_ep_group()
+            if self.use_expert_choice and self._ep_group is not None:
+                self._ec_dispatcher = EpAllToAllDispatcher(self._ep_group, self.ep_size, self.num_local_experts, self._ep_rank)
+        else:
+            # DeepSpeed backend manages EP internally; keep local counts simple.
+            self._ep_group = None
+            self.num_local_experts = self.num_experts
+            self._global_expert_offset = 0
 
         # Aux bookkeeping
         self._last_aux_loss: Optional[torch.Tensor] = None
@@ -116,33 +127,23 @@ class MoEFeedForward(nn.Module):
         self._ep_group = MoEFeedForward.EP_GROUP_CACHE[ranks]
         self.num_local_experts = self.num_experts // self.ep_size
         self._global_expert_offset = group_idx * self.num_local_experts
+        self._ep_rank = rank - start
 
     def _init_standard_moe(self, expert: nn.Module, use_tutel: bool, drop_tokens: bool, use_megablocks_dropless: bool) -> None:
         if use_megablocks_dropless:
-            try:
-                from megablocks.torch.moe import DroplessMoE as MegaBlocksMoE  # type: ignore
+            from megablocks.torch.moe import DroplessMoE as MegaBlocksMoE  # type: ignore
 
-                self._backend = "megablocks"
-                self.moe = MegaBlocksMoE(
-                    hidden_size=self.hidden_size,
-                    expert=expert,
-                    num_experts=self.num_experts,
-                    ep_size=self.ep_size,
-                    capacity_factor=self.capacity_factor,
-                    min_capacity=self.min_capacity,
-                    noisy_gate_policy=self.noisy_gate_policy,
-                )
-            except Exception as err:
-                print("[MoE][ERROR] MegaBlocks dropless routing requested but unavailable/incompatible:", err)
-                raise RuntimeError(
-                    "Requested MegaBlocks dropless routing but megablocks is not available or incompatible."
-                ) from err
+            self._backend = "megablocks"
+            self.moe = MegaBlocksMoE(
+                hidden_size=self.hidden_size,
+                expert=expert,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
+                capacity_factor=self.capacity_factor,
+                min_capacity=self.min_capacity,
+                noisy_gate_policy=self.noisy_gate_policy,
+            )
         if self.moe is None:
-            if DeepSpeedMoE is None:
-                print("[MoE][ERROR] DeepSpeed MoE extension not found. Please install deepspeed with --enable-moe.")
-                raise RuntimeError(
-                    "DeepSpeed MoE extension not found. Install deepspeed>=0.12 with --enable-moe."
-                )
             self.moe = DeepSpeedMoE(
                 hidden_size=self.hidden_size,
                 expert=expert,
@@ -220,10 +221,7 @@ class MoEFeedForward(nn.Module):
                             self._last_expert_counts.float(), alpha=(1.0 - self._ema_decay)
                         )
             if len(outputs) >= 4 and isinstance(outputs[3], torch.Tensor):
-                try:
-                    self._last_drop_ratio = float(outputs[3].detach().float().sum().item())
-                except Exception:
-                    self._last_drop_ratio = None
+                self._last_drop_ratio = float(outputs[3].detach().float().sum().item())
             if self.shared_expert is not None:
                 shared_out = self.shared_expert(input_tensor).to(out.dtype)
                 out = out + self.shared_expert_scale * shared_out
@@ -244,30 +242,36 @@ class MoEFeedForward(nn.Module):
         scores = self.router(tokens.float())
         if self._router_noise_std > 0 and self.training:
             scores = scores + self._router_noise_std * torch.randn_like(scores)
-        probs = torch.softmax(scores, dim=-1)
+        temp = max(self._router_temperature, 1e-6)
         N, E = scores.shape
         capacity = max(self.min_capacity, math.ceil(self.capacity_factor * N / E))
         capacity = min(capacity, N)
-        top_scores, top_indices = torch.topk(scores.transpose(0, 1), k=capacity, dim=-1)
-        selected = tokens.index_select(0, top_indices.reshape(-1)).view(E, capacity, -1)
-        weights = torch.softmax(top_scores, dim=-1).unsqueeze(-1).to(dtype)
-        output = torch.zeros_like(tokens)
         counts_local = torch.zeros(self.num_experts, device=tokens.device)
         importance_local = torch.zeros(self.num_experts, device=tokens.device)
-        for local_idx in range(self.num_local_experts):
-            global_idx = self._global_expert_offset + local_idx
-            expert_tokens = selected[global_idx].to(dtype)
-            gate = weights[global_idx]
-            expert_out = self.local_experts[local_idx](expert_tokens)
-            weighted = expert_out * gate
-            idx = top_indices[global_idx]
-            output.index_add_(0, idx, weighted)
-            counts_local[global_idx] = counts_local[global_idx] + float(capacity)
-            importance_local[global_idx] = importance_local[global_idx] + float(top_scores[global_idx].sum().item())
-        if self._ep_group is not None:
-            dist.all_reduce(output, group=self._ep_group)
-            dist.all_reduce(counts_local, group=self._ep_group)
-            dist.all_reduce(importance_local, group=self._ep_group)
+        if getattr(self, "_ec_dispatcher", None) is not None:
+            # EP token-level routing for EC
+            agg, counts, importance = self._ec_dispatcher.route_expert_choice(
+                tokens.to(dtype), scores, capacity, self.num_local_experts, temperature=temp,
+                local_expert_call=lambda lid, x: self.local_experts[lid](x)
+            )
+            output = agg.to(dtype)
+            counts_local = counts
+            importance_local = importance
+        else:
+            top_scores, top_indices = torch.topk((scores / temp).transpose(0, 1), k=capacity, dim=-1)
+            selected = tokens.index_select(0, top_indices.reshape(-1)).view(E, capacity, -1)
+            weights = torch.softmax(top_scores, dim=-1).unsqueeze(-1).to(dtype)
+            output = torch.zeros_like(tokens)
+            for local_idx in range(self.num_local_experts):
+                global_idx = self._global_expert_offset + local_idx
+                expert_tokens = selected[global_idx].to(dtype)
+                gate = weights[global_idx]
+                expert_out = self.local_experts[local_idx](expert_tokens)
+                weighted = expert_out * gate
+                idx = top_indices[global_idx]
+                output.index_add_(0, idx, weighted)
+                counts_local[global_idx] += float(capacity)
+                importance_local[global_idx] += float(top_scores[global_idx].sum().item())
         total_counts = counts_local.sum().clamp(min=1.0)
         counts_prob = counts_local / total_counts
         total_importance = importance_local.sum().clamp(min=1.0)
@@ -282,10 +286,17 @@ class MoEFeedForward(nn.Module):
         if self.shared_expert is not None:
             shared_out = self.shared_expert(tokens.to(dtype))
             output = output + self.shared_expert_scale * shared_out
-        self._last_moe_forward_ms = 0.0  # computed via dispatcher above if needed
+        self._last_moe_forward_ms = 0.0
         if hidden_states.dim() == 3:
             return output.reshape(original_shape)
         return output
+
+    # Runtime router controls (apply to expert-choice/megablocks backends)
+    def set_router_temperature(self, temperature: float) -> None:
+        self._router_temperature = float(temperature)
+
+    def set_router_jitter(self, std: float) -> None:
+        self._router_noise_std = float(std)
 
 
 __all__ = ["MoEFeedForward", "ExpertFFN", "split_params_into_different_moe_groups_for_optimizer"]

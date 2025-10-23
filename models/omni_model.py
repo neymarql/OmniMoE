@@ -303,6 +303,37 @@ class OmniMoEModel(PreTrainedModel):
     def set_projector_router_jitter(self, std: float) -> None:
         self.projector.set_router_jitter(std)
 
+    # LLM MoE router controls
+    def set_llm_router_temperature(self, temperature: float) -> None:
+        if hasattr(self, "qwen") and hasattr(self.qwen, "set_router_temperature"):
+            self.qwen.set_router_temperature(temperature)
+
+    def set_llm_router_jitter(self, std: float) -> None:
+        if hasattr(self, "qwen") and hasattr(self.qwen, "set_router_jitter"):
+            self.qwen.set_router_jitter(std)
+
+    # Vision MoE router controls
+    def set_vision_router_temperature(self, temperature: float) -> None:
+        if hasattr(self, "vision") and hasattr(self.vision, "set_router_temperature"):
+            self.vision.set_router_temperature(temperature)
+
+    def set_vision_router_jitter(self, std: float) -> None:
+        if hasattr(self, "vision") and hasattr(self.vision, "set_router_jitter"):
+            self.vision.set_router_jitter(std)
+
+    # Enable/disable EP dispatcher micro-profiling across modules
+    def set_dispatcher_profiling(self, enabled: bool) -> None:
+        flag = bool(enabled)
+        for m in self.modules():
+            if hasattr(m, "dispatcher") and getattr(m, "dispatcher") is not None:
+                disp = getattr(m, "dispatcher")
+                if hasattr(disp, "enable_profiling"):
+                    disp.enable_profiling(flag)
+            if hasattr(m, "_ec_dispatcher") and getattr(m, "_ec_dispatcher", None) is not None:
+                disp = getattr(m, "_ec_dispatcher")
+                if hasattr(disp, "enable_profiling"):
+                    disp.enable_profiling(flag)
+
     def configure_optimizer_param_groups(self) -> Any:
         if split_params_into_different_moe_groups_for_optimizer is None:
             return self.parameters()

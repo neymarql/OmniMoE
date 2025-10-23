@@ -3,6 +3,14 @@ warmup:
   learning_rate: 2.0e-04
   warmup_steps: 500
   max_steps: 5000
+  # Branch-specific router schedules (fallback to router_temperature if omitted)
+  router_temperature_projector: { start: 1.6, end: 1.1, steps: 5000 }
+  router_temperature_llm:       { start: 1.5, end: 1.1, steps: 5000 }
+  router_temperature_vision:    { start: 1.4, end: 1.1, steps: 5000 }
+  # Branch-specific jitter schedules or constants (fallback to router_jitter_std if omitted)
+  router_jitter_projector: { start: 0.02, end: 0.01, steps: 5000 }
+  router_jitter_llm:       { start: 0.02, end: 0.01, steps: 5000 }
+  router_jitter_vision:    { start: 0.015, end: 0.01, steps: 5000 }
   router_temperature: { start: 1.5, end: 1.1, steps: 5000 }
   router_jitter_std: 0.02
   freeze:
@@ -15,6 +23,12 @@ align:
   learning_rate: 1.0e-04
   warmup_steps: 1000
   max_steps: 12000
+  router_temperature_projector: { start: 1.1, end: 1.0, steps: 12000 }
+  router_temperature_llm:       { start: 1.1, end: 1.0, steps: 12000 }
+  router_temperature_vision:    { start: 1.1, end: 1.0, steps: 12000 }
+  router_jitter_projector: 0.01
+  router_jitter_llm:       0.01
+  router_jitter_vision:    0.01
   router_temperature: { start: 1.1, end: 1.0, steps: 12000 }
   router_jitter_std: 0.01
   freeze:
@@ -27,6 +41,12 @@ reasoning:
   learning_rate: 5.0e-05
   warmup_steps: 500
   max_steps: 6000
+  router_temperature_projector: { start: 1.0, end: 1.0, steps: 6000 }
+  router_temperature_llm:       { start: 1.0, end: 1.0, steps: 6000 }
+  router_temperature_vision:    { start: 1.0, end: 1.0, steps: 6000 }
+  router_jitter_projector: 0.0
+  router_jitter_llm:       0.0
+  router_jitter_vision:    0.0
   router_temperature: { start: 1.0, end: 1.0, steps: 6000 }
   router_jitter_std: 0.0
   freeze:
@@ -48,6 +68,7 @@ global:
   eval_batch_size: 4
   train_batch_size_per_gpu: 2
   seed: 42
+  dispatch_profile: false
   use_flash_attention: true
   gradient_checkpointing: true
   resume_from: ""

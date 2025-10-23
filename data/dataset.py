@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset, Sampler
 import torchvision.transforms as T
 from transformers import AutoTokenizer
 
@@ -129,6 +129,23 @@ class ConversationDataset(Dataset):
             image = img.convert("RGB")
         return self.image_transform(image)
 
+    def count_missing_images(self) -> int:
+        """Scan the manifest and count missing image files on disk.
+
+        This is O(N) over the manifest and purely informational; call it when
+        building the dataloader to report dataset hygiene.
+        """
+        missing = 0
+        for rec in self.records:
+            image_list: List[str] = rec.get("image", []) or []
+            if not image_list:
+                continue
+            image_rel_path = image_list[0]
+            full_path = os.path.join(self.image_folder, image_rel_path)
+            if not os.path.isfile(full_path):
+                missing += 1
+        return missing
+
     def __getitem__(self, index: int) -> ConversationSample:
         record = self.records[index]
         conversations = record.get("conversations", [])
@@ -154,60 +171,129 @@ class ConversationDataset(Dataset):
         )
 
 
-class MultiSourceDataset(Dataset):
-    """Mixture dataset drawing from multiple ConversationDataset instances."""
+class WeightedMultiSourceSampler(Sampler[int]):
+    """Sampler that draws from grouped datasets according to sample_rate.
 
-    def __init__(self, datasets: List[ConversationDataset], sample_rates: List[float]) -> None:
-        if len(datasets) != len(sample_rates):
-            raise ValueError("datasets and sample_rates must be same length")
-        if not datasets:
-            raise ValueError("At least one dataset must be provided")
-        self.datasets = datasets
-        total = float(sum(sample_rates))
-        if total <= 0:
+    Works with a top-level ConcatDataset of dataset groups. Each group is a
+    ConcatDataset of one or more ConversationDataset built from the same
+    data source. The sampler precomputes an epoch plan so we can log exact
+    per-group sampling counts.
+    """
+
+    def __init__(self, group_lengths: List[int], sample_rates: List[float], seed: int = 42, epoch_length: int | None = None) -> None:
+        if len(group_lengths) != len(sample_rates) or len(group_lengths) == 0:
+            raise ValueError("group_lengths and sample_rates must be same non-zero length")
+        self.group_lengths = group_lengths
+        self.sample_rates = sample_rates
+        self.seed = int(seed)
+        self.epoch_length = int(epoch_length) if epoch_length is not None else int(sum(group_lengths))
+        # Compute normalized weights and planned counts
+        total_rate = float(sum(sample_rates))
+        if total_rate <= 0:
             raise ValueError("Sum of sample_rates must be positive")
-        probs = [rate / total for rate in sample_rates]
-        cumulative: List[float] = []
-        running = 0.0
-        for prob in probs:
-            running += prob
-            cumulative.append(running)
-        cumulative[-1] = 1.0
-        self.cumulative = cumulative
-        self.length = max(int(sum(len(ds) * prob for ds, prob in zip(datasets, probs))), 1)
+        weights = [r / total_rate for r in sample_rates]
+        counts = [int(round(w * self.epoch_length)) for w in weights]
+        delta = self.epoch_length - sum(counts)
+        if delta != 0:
+            # Adjust last bucket to match exact epoch_length
+            counts[-1] += delta
+        self.planned_counts = counts
+        # Precompute group base offsets for top-level ConcatDataset
+        base = 0
+        self.group_offsets: List[int] = []
+        for L in group_lengths:
+            self.group_offsets.append(base)
+            base += L
+        # Build index plan deterministically
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        indices: List[int] = []
+        for gid, (L, c) in enumerate(zip(group_lengths, counts)):
+            if L <= 0 or c <= 0:
+                continue
+            # Sample with replacement to allow over/under-sampling
+            local = torch.randint(low=0, high=L, size=(c,), generator=g)
+            global_idx = local + self.group_offsets[gid]
+            indices.extend(global_idx.tolist())
+        # Shuffle final plan
+        perm = torch.randperm(len(indices), generator=g).tolist()
+        self.plan: List[int] = [indices[i] for i in perm]
 
     def __len__(self) -> int:
-        return self.length
+        return len(self.plan)
 
-    def _choose_dataset(self) -> ConversationDataset:
-        r = random.random()
-        for idx, boundary in enumerate(self.cumulative):
-            if r <= boundary:
-                return self.datasets[idx]
-        return self.datasets[-1]
-
-    def __getitem__(self, index: int) -> ConversationSample:
-        dataset = self._choose_dataset()
-        sample_idx = random.randint(0, len(dataset) - 1)
-        return dataset[sample_idx]
+    def __iter__(self):
+        return iter(self.plan)
 
 
-def load_datasets_for_stage(stage_config: Dict[str, Any], tokenizer: AutoTokenizer, max_text_length: int) -> MultiSourceDataset:
-    """Utility to build a MultiSourceDataset from the stage configuration."""
+def load_datasets_for_stage(stage_config: Dict[str, Any], tokenizer: AutoTokenizer, max_text_length: int,
+                            seed: int = 42, scan_missing: bool = True):
+    """Build a grouped ConcatDataset and a WeightedMultiSourceSampler from config.
 
-    datasets: List[ConversationDataset] = []
+    Returns (concat_dataset, sampler, info_dict) where info_dict contains
+    lengths, planned_counts and missing image statistics per group.
+    """
+    group_datasets: List[ConcatDataset] = []
+    group_lengths: List[int] = []
     sample_rates: List[float] = []
-    for source in stage_config.get("data_sources", []):
+    group_info: List[Dict[str, Any]] = []
+
+    for si, source in enumerate(stage_config.get("data_sources", [])):
         data_paths: Iterable[str] = source.get("data_path", [])
         image_folder: str = source.get("image_folder", "")
-        sample_rate: float = float(source.get("sample_rate", 1.0))
+        rate: float = float(source.get("sample_rate", 1.0))
+        cds: List[ConversationDataset] = []
+        missing = 0
+        total = 0
         for manifest in data_paths:
-            dataset = ConversationDataset(
+            ds = ConversationDataset(
                 json_path=manifest,
                 image_folder=image_folder,
                 tokenizer=tokenizer,
                 max_text_length=max_text_length,
             )
-            datasets.append(dataset)
-            sample_rates.append(sample_rate)
-    return MultiSourceDataset(datasets=datasets, sample_rates=sample_rates)
+            cds.append(ds)
+            total += len(ds)
+            if scan_missing:
+                missing += ds.count_missing_images()
+        if not cds:
+            continue
+        group_ds = ConcatDataset(cds)
+        group_datasets.append(group_ds)
+        group_lengths.append(len(group_ds))
+        sample_rates.append(rate)
+        group_info.append({
+            "group_index": si,
+            "manifests": list(data_paths),
+            "image_folder": image_folder,
+            "length": len(group_ds),
+            "missing_images": missing,
+            "sample_rate": rate,
+        })
+
+    if not group_datasets:
+        raise ValueError("No datasets constructed for stage")
+
+    top_level = ConcatDataset(group_datasets)
+    sampler = WeightedMultiSourceSampler(group_lengths=group_lengths, sample_rates=sample_rates, seed=seed)
+
+    # Log sampling plan summary
+    planned = sampler.planned_counts
+    total_planned = sum(planned)
+    summary = []
+    for i, info in enumerate(group_info):
+        pct = (planned[i] / max(1, total_planned)) * 100.0
+        summary.append({
+            **info,
+            "planned_draws": planned[i],
+            "planned_percent": pct,
+        })
+    stage_info = {
+        "groups": summary,
+        "total_planned": total_planned,
+        "epoch_length": len(sampler),
+    }
+    print("[Dataset] Stage composition summary:")
+    for item in summary:
+        print("  - group={group_index} len={length} rate={sample_rate} planned={planned_draws} ({planned_percent:.2f}%) missing_images={missing_images} folder={image_folder}".format(**item))
+    return top_level, sampler, stage_info

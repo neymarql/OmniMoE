@@ -120,5 +120,16 @@ class SiglipVisionWithMoE(nn.Module):
             result["cls"] = last_hidden.mean(dim=1)
         return result
 
+    # Propagate router temperature/jitter to MoE layers (if applicable)
+    def set_router_temperature(self, temperature: float) -> None:
+        for m in self.modules():
+            if isinstance(m, MoEFeedForward):
+                m.set_router_temperature(temperature)
+
+    def set_router_jitter(self, std: float) -> None:
+        for m in self.modules():
+            if isinstance(m, MoEFeedForward):
+                m.set_router_jitter(std)
+
 
 __all__ = ["SiglipVisionWithMoE"]

@@ -69,25 +69,29 @@ class CurriculumTrainer:
             model_parameters=trainable_params,
             config=self.deepspeed_cfg,
         )
-        try:
-            maybe_load_checkpoint(self.model_engine, resume_from)
-        except Exception as e:
-            print(f"[Trainer][ERROR] Failed to load checkpoint '{resume_from}': {e}")
-            raise
+        # Configure dispatcher profiling (global flag)
+        prof_flag = bool(self.hyperparams.get("global", {}).get("dispatch_profile", False))
+        self.model.set_dispatcher_profiling(prof_flag)
+        if deepspeed.comm.get_rank() == 0:
+            print(f"[Trainer] EP dispatcher profiling: {'enabled' if prof_flag else 'disabled'}")
+        maybe_load_checkpoint(self.model_engine, resume_from)
+        self._resume_meta = None
+        if resume_from:
+            meta_path = os.path.join(resume_from, "omni_meta.json")
+            if os.path.isfile(meta_path):
+                import json
+                with open(meta_path, "r", encoding="utf-8") as fp:
+                    self._resume_meta = json.load(fp)
         if deepspeed.comm.get_rank() == 0:
             self._log_param_summary()
         self.curriculum_order: List[str] = list(hyperparams.get("curriculum", {}).get("order", []))
         if not self.curriculum_order:
             self.curriculum_order = sorted(dataset_cfg.keys())
         # TensorBoard writer (rank 0 only)
-        try:
-            log_dir = os.path.join(self.output_dir, "runs")
-            if deepspeed.comm.get_rank() == 0:
-                self.tb_writer = SummaryWriter(log_dir=log_dir)
-            else:
-                self.tb_writer = None
-        except Exception as e:
-            print(f"[Trainer][WARN] TensorBoard SummaryWriter unavailable: {e}")
+        log_dir = os.path.join(self.output_dir, "runs")
+        if deepspeed.comm.get_rank() == 0:
+            self.tb_writer = SummaryWriter(log_dir=log_dir)
+        else:
             self.tb_writer = None
         if torch.cuda.is_available():
             self._step_start_event = torch.cuda.Event(enable_timing=True)
@@ -129,22 +133,26 @@ class CurriculumTrainer:
         for name, count, req_grad in preview:
             print(f"    {name}: numel={count}, requires_grad={req_grad}")
 
-    def _build_dataloader(self, stage: str) -> DataLoader:
+    def _build_dataloader(self, stage: str):
         stage_cfg = self.dataset_cfg[stage]
-        dataset = load_datasets_for_stage(
+        dataset, sampler, stage_info = load_datasets_for_stage(
             stage_cfg,
             tokenizer=self.tokenizer,
             max_text_length=self.config.max_text_length,
+            seed=self.hyperparams.get("global", {}).get("seed", 42),
+            scan_missing=True,
         )
         per_gpu_batch = self.hyperparams.get("global", {}).get("train_batch_size_per_gpu", 2)
-        return DataLoader(
+        dl = DataLoader(
             dataset,
             batch_size=per_gpu_batch,
-            shuffle=True,
+            shuffle=False,
             num_workers=4,
             pin_memory=True,
+            sampler=sampler,
             collate_fn=multimodal_collate_fn,
         )
+        return dl, stage_info
 
     def _apply_freeze(self, stage: str) -> None:
         stage_cfg = self.hyperparams.get(stage, {})
@@ -235,6 +243,14 @@ class CurriculumTrainer:
             projector_lr_mult=g.get("projector_lr_mult", 1.0),
             optimizer_name=g.get("optimizer", "adamw"),
         )
+        # Print transparent summary of optimizer groups for this stage
+        total_trainable = sum(int(p.requires_grad) * p.numel() for p in self.model.parameters())
+        print(f"[Trainer][Rebuild] Trainable parameters: {total_trainable:,}")
+        for gi, group in enumerate(optimizer.param_groups):
+            group_params = group.get("params", [])
+            n_params = sum(p.numel() for p in group_params)
+            lr_val = group.get("lr", lr)
+            print(f"  - group{gi}: params={n_params:,} lr={lr_val}")
         print("[Trainer] Rebuilding DeepSpeed engine for new stage/lr...")
         self.model_engine, self.optimizer, _, _ = deepspeed.initialize(
             model=self.model,
@@ -242,6 +258,127 @@ class CurriculumTrainer:
             model_parameters=trainable_params,
             config=self.deepspeed_cfg,
         )
+
+    def rebuild_optimizer_on_stage_change(self, stage: str, learning_rate: float, total_steps: int):
+        """Freeze/unfreeze per stage, rebuild optimizer param groups, and re-create scheduler.
+
+        Must be called whenever entering a new stage to ensure param group
+        membership matches the current freeze mask and LR strategy.
+        """
+        # 1) Apply stage freeze mask first
+        self._apply_freeze(stage)
+        # 2) Rebuild engine with fresh optimizer groups (based on requires_grad)
+        self._rebuild_engine(learning_rate)
+        # 3) Recreate scheduler for this stage
+        warmup_steps = self.hyperparams.get(stage, {}).get("warmup_steps", 0)
+        scheduler = build_scheduler(self.optimizer, {"warmup_steps": warmup_steps}, total_steps)
+        # Re-apply dispatcher profiling flag on stage change
+        prof_flag = bool(self.hyperparams.get("global", {}).get("dispatch_profile", False))
+        self.model.set_dispatcher_profiling(prof_flag)
+        if deepspeed.comm.get_rank() == 0:
+            print(f"[Trainer][Stage {stage}] EP dispatcher profiling: {'enabled' if prof_flag else 'disabled'}")
+        return scheduler
+
+    # -------------------- Checkpoint Metadata Utilities --------------------
+    def _optimizer_fingerprint(self) -> list[dict]:
+        fp = []
+        for gi, g in enumerate(self.optimizer.param_groups):
+            params = g.get("params", [])
+            n = sum(p.numel() for p in params)
+            lr = float(g.get("lr", 0.0))
+            fp.append({"group": gi, "numel": int(n), "lr": lr})
+        return fp
+
+    def _router_state(self) -> dict:
+        state = {"projector": {}, "llm": {}, "vision": {}}
+        # Projector
+        proj = getattr(self.model, "projector", None)
+        if proj is not None:
+            state["projector"]["temperature"] = float(getattr(proj, "_temperature", 1.0))
+            state["projector"]["jitter"] = float(getattr(proj, "_jitter_std", 0.0))
+        # LLM MoE: gather avg across MoEFeedForward modules
+        import types
+        temps, jits = [], []
+        for m in self.model.modules():
+            if getattr(m, "__class__", types.SimpleNamespace()).__name__ == "MoEFeedForward":
+                if hasattr(m, "_moe_scope") and getattr(m, "_moe_scope") == "text":
+                    temps.append(float(getattr(m, "_router_temperature", 1.0)))
+                    jits.append(float(getattr(m, "_router_noise_std", 0.0)))
+        if temps:
+            state["llm"]["temperature"] = sum(temps) / len(temps)
+            state["llm"]["jitter"] = sum(jits) / len(jits) if jits else 0.0
+        # Vision MoE
+        temps, jits = [], []
+        for m in self.model.modules():
+            if getattr(m, "__class__", types.SimpleNamespace()).__name__ == "MoEFeedForward":
+                if hasattr(m, "_moe_scope") and getattr(m, "_moe_scope") == "vision":
+                    temps.append(float(getattr(m, "_router_temperature", 1.0)))
+                    jits.append(float(getattr(m, "_router_noise_std", 0.0)))
+        if temps:
+            state["vision"]["temperature"] = sum(temps) / len(temps)
+            state["vision"]["jitter"] = sum(jits) / len(jits) if jits else 0.0
+        return state
+
+    def _ep_digest(self) -> dict:
+        d = {"world_size": 1, "rank": 0}
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            d["world_size"] = torch.distributed.get_world_size()
+            d["rank"] = torch.distributed.get_rank()
+        # EP sizes from config
+        d["ep_text"] = int(self.config.text_moe_cfg.get("ep_size", 1))
+        d["ep_vision"] = int(self.config.vision_moe_cfg.get("ep_size", 1))
+        d["ep_projector"] = int(self.config.projector_cfg.get("ep_size", 1))
+        # Rank group indices (if applicable)
+        def grp(ep):
+            if ep <= 1 or d["world_size"] <= 1:
+                return -1
+            return d["rank"] // ep
+        d["group_text"] = grp(d["ep_text"])
+        d["group_vision"] = grp(d["ep_vision"])
+        d["group_projector"] = grp(d["ep_projector"])
+        return d
+
+    def _collect_metadata_snapshot(self, stage: str, global_step: int) -> dict:
+        return {
+            "stage_name": stage,
+            "global_step": int(global_step),
+            "optimizer": self._optimizer_fingerprint(),
+            "router": self._router_state(),
+            "ep_digest": self._ep_digest(),
+        }
+
+    def _write_meta(self, ckpt_dir: str, meta: dict) -> None:
+        import json
+        path = os.path.join(ckpt_dir, "omni_meta.json")
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(meta, fp, indent=2, ensure_ascii=False)
+
+    def _verify_resume_consistency(self, stage: str, global_step: int) -> None:
+        if not getattr(self, "_resume_meta", None):
+            return
+        cur = self._collect_metadata_snapshot(stage, global_step)
+        prev = self._resume_meta
+        print(f"[Resume] Verifying checkpoint metadata vs current stage '{stage}'...")
+        # Stage name
+        if prev.get("stage_name") != stage:
+            print(f"  - Stage mismatch: ckpt={prev.get('stage_name')} current={stage}")
+        # Optimizer groups
+        p_opt = prev.get("optimizer", [])
+        c_opt = cur.get("optimizer", [])
+        if len(p_opt) != len(c_opt):
+            print(f"  - Optimizer group count differs: ckpt={len(p_opt)} current={len(c_opt)}")
+        for i, (pg, cg) in enumerate(zip(p_opt, c_opt)):
+            if int(pg.get("numel", -1)) != int(cg.get("numel", -1)) or float(pg.get("lr", -1.0)) != float(cg.get("lr", -1.0)):
+                print(f"  - Group{i} diff: ckpt(numel={pg.get('numel')}, lr={pg.get('lr')}) vs current(numel={cg.get('numel')}, lr={cg.get('lr')})")
+        # Router
+        for branch in ("projector", "llm", "vision"):
+            p_b = prev.get("router", {}).get(branch, {})
+            c_b = cur.get("router", {}).get(branch, {})
+            if p_b != c_b:
+                print(f"  - Router {branch} diff: ckpt={p_b} current={c_b}")
+        # EP digest
+        if prev.get("ep_digest") != cur.get("ep_digest"):
+            print(f"  - EP digest diff: ckpt={prev.get('ep_digest')} current={cur.get('ep_digest')}")
 
     def _maybe_eval(self, stage: str, step: int, stage_dir: str) -> None:
         eval_every = int(self.hyperparams.get("curriculum", {}).get("eval_interval_steps", 0) or 0)
@@ -253,60 +390,115 @@ class CurriculumTrainer:
         hf_dir = f"{stage_dir}/hf-step-{step}"
         save_hf_checkpoint(self.model_engine, self.tokenizer, hf_dir)
         if deepspeed.comm.get_rank() == 0:
-            try:
-                subprocess.run([
-                    "bash",
-                    "evaluation/run_opencompass.sh",
-                    hf_dir,
-                    "OmniMoE/configs/omni_moe_config.json",
-                ], check=False)
-            except FileNotFoundError:
-                print("[Eval] OpenCompass runner not found; skip.")
+            subprocess.run([
+                "bash",
+                "evaluation/run_opencompass.sh",
+                hf_dir,
+                "OmniMoE/configs/omni_moe_config.json",
+            ], check=False)
 
     def train(self) -> None:
         global_step = 0
         for stage in self.curriculum_order:
             print(f"[Trainer] Preparing dataloader for stage '{stage}'...")
-            dataloader = self._build_dataloader(stage)
+            dataloader, stage_info = self._build_dataloader(stage)
+            # Quick data mix summary at stage start
+            if stage_info and "groups" in stage_info:
+                print(f"[Trainer][Stage {stage}] Data mix summary (epoch_length={stage_info.get('epoch_length')}, total_planned={stage_info.get('total_planned')}):")
+                for item in stage_info["groups"]:
+                    print(
+                        "  - group={group_index} len={length} rate={sample_rate} planned={planned_draws} ({planned_percent:.2f}%) missing_images={missing_images} folder={image_folder}".format(
+                            **item
+                        )
+                    )
             stage_params = self.hyperparams.get(stage, {})
             epochs = stage_params.get("epochs", 1)
             learning_rate = stage_params.get("learning_rate", 1e-5)
-            # apply stage freezing and projector depth, then rebuild engine
-            self._apply_freeze(stage)
+            # apply stage projector depth selection
             proj_layers = stage_params.get("projector_layers", None)
             if proj_layers is not None and hasattr(self.model, "set_projector_active_layers"):
                 self.model.set_projector_active_layers(int(proj_layers))
-            self._rebuild_engine(learning_rate)
             warmup_steps = stage_params.get("warmup_steps", 0)
             total_steps = stage_params.get("max_steps", len(dataloader) * epochs)
-            scheduler = build_scheduler(self.optimizer, {"warmup_steps": warmup_steps}, total_steps)
+            scheduler = self.rebuild_optimizer_on_stage_change(stage, learning_rate, total_steps)
             stage_dir = f"{self.output_dir}/{stage}"
             ensure_dir(stage_dir)
 
             # Router schedules (projector-only; DS MoE gates live inside kernels)
-            temp_sched = stage_params.get("router_temperature", {})
-            temp_start = float(temp_sched.get("start", 1.0))
-            temp_end = float(temp_sched.get("end", 1.0))
-            temp_steps = int(temp_sched.get("steps", total_steps)) if total_steps else 0
-            jitter = float(stage_params.get("router_jitter_std", 0.0))
+            # Router temperature schedules (branch-specific with fallback)
+            temp_common = stage_params.get("router_temperature", {})
+            temp_proj = stage_params.get("router_temperature_projector", temp_common)
+            temp_llm = stage_params.get("router_temperature_llm", temp_common)
+            temp_vis = stage_params.get("router_temperature_vision", temp_common)
+
+            def _sched_val(sched: Dict, step: int, default_steps: int) -> float:
+                if not isinstance(sched, dict):
+                    return float(sched)
+                start = float(sched.get("start", 1.0))
+                end = float(sched.get("end", start))
+                steps = int(sched.get("steps", default_steps)) if default_steps else int(sched.get("steps", 0))
+                if steps <= 0:
+                    return end
+                t = min(step, steps)
+                return start + (end - start) * (t / max(1, steps))
+
+            # Jitter schedules or constants (branch-specific with fallback)
+            jitter_common = stage_params.get("router_jitter_std", 0.0)
+            jitter_proj = stage_params.get("router_jitter_projector", jitter_common)
+            jitter_llm = stage_params.get("router_jitter_llm", jitter_common)
+            jitter_vis = stage_params.get("router_jitter_vision", jitter_common)
+
+            # Apply initial jitter for each branch
+            jp0 = _sched_val(jitter_proj, 0, total_steps)
+            jl0 = _sched_val(jitter_llm, 0, total_steps)
+            jv0 = _sched_val(jitter_vis, 0, total_steps)
             if hasattr(self.model, "set_projector_router_jitter"):
-                self.model.set_projector_router_jitter(jitter)
+                self.model.set_projector_router_jitter(jp0)
+            if hasattr(self.model, "set_llm_router_jitter"):
+                self.model.set_llm_router_jitter(jl0)
+            if hasattr(self.model, "set_vision_router_jitter"):
+                self.model.set_vision_router_jitter(jv0)
+
+            # Initialize router temps at step 0 for consistency with resume checks
+            # (same schedule function used below per-step)
+            # temp_common/proj/llm/vis defined above
+            cur_tp0 = _sched_val(temp_proj, 0, total_steps)
+            cur_tl0 = _sched_val(temp_llm, 0, total_steps)
+            cur_tv0 = _sched_val(temp_vis, 0, total_steps)
+            if hasattr(self.model, "set_projector_router_temperature"):
+                self.model.set_projector_router_temperature(cur_tp0)
+            if hasattr(self.model, "set_llm_router_temperature"):
+                self.model.set_llm_router_temperature(cur_tl0)
+            if hasattr(self.model, "set_vision_router_temperature"):
+                self.model.set_vision_router_temperature(cur_tv0)
+
+            # Verify resume consistency now that optimizer and router are set
+            self._verify_resume_consistency(stage, global_step)
 
             for epoch in range(epochs):
                 for batch_idx, batch in enumerate(dataloader):
                     batch = {k: v.to(self.model_engine.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                     # Apply temperature schedule
-                    if temp_steps > 0 and hasattr(self.model, "set_projector_router_temperature"):
-                        t = min(global_step, temp_steps)
-                        cur_temp = temp_start + (temp_end - temp_start) * (t / max(1, temp_steps))
-                        self.model.set_projector_router_temperature(cur_temp)
+                    # Update temperatures per-branch
+                    cur_tp = _sched_val(temp_proj, global_step, total_steps)
+                    cur_tl = _sched_val(temp_llm, global_step, total_steps)
+                    cur_tv = _sched_val(temp_vis, global_step, total_steps)
+                    if hasattr(self.model, "set_projector_router_temperature"):
+                        self.model.set_projector_router_temperature(cur_tp)
+                    if hasattr(self.model, "set_llm_router_temperature"):
+                        self.model.set_llm_router_temperature(cur_tl)
+                    if hasattr(self.model, "set_vision_router_temperature"):
+                        self.model.set_vision_router_temperature(cur_tv)
+                    # Update jitter per-branch if schedules are dicts
+                    if isinstance(jitter_proj, dict) and hasattr(self.model, "set_projector_router_jitter"):
+                        self.model.set_projector_router_jitter(_sched_val(jitter_proj, global_step, total_steps))
+                    if isinstance(jitter_llm, dict) and hasattr(self.model, "set_llm_router_jitter"):
+                        self.model.set_llm_router_jitter(_sched_val(jitter_llm, global_step, total_steps))
+                    if isinstance(jitter_vis, dict) and hasattr(self.model, "set_vision_router_jitter"):
+                        self.model.set_vision_router_jitter(_sched_val(jitter_vis, global_step, total_steps))
                     if self._step_start_event is not None:
                         self._step_start_event.record()
-                    try:
-                        outputs = self.model_engine(**batch)
-                    except Exception as e:
-                        print(f"[Trainer][ERROR] Forward/backward failure at step {global_step}: {e}")
-                        raise
+                    outputs = self.model_engine(**batch)
                     loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
                     self.model_engine.backward(loss)
                     self.model_engine.step()
@@ -325,6 +517,10 @@ class CurriculumTrainer:
                             aux_text = aux_vis = 0.0
                             moe_ms = 0.0
                             drop_text = drop_vis = 0.0
+                            # branch router temps/jitter
+                            proj_T = getattr(self.model.projector, "_temperature", 1.0)
+                            proj_J = getattr(self.model.projector, "_jitter_std", 0.0)
+                            T_text = []; J_text = []; T_vis = []; J_vis = []
                             for m in self.model.modules():
                                 if hasattr(m, "_last_aux_loss") and getattr(m, "_last_aux_loss") is not None:
                                     sc = getattr(m, "_moe_scope", None)
@@ -339,6 +535,15 @@ class CurriculumTrainer:
                                     elif sc == "vision": drop_vis += d
                                 if hasattr(m, "_last_moe_forward_ms") and getattr(m, "_last_moe_forward_ms") is not None:
                                     moe_ms += float(getattr(m, "_last_moe_forward_ms"))
+                                # Collect temps/jitter from MoE blocks
+                                if getattr(m, "__class__", None) and m.__class__.__name__ == "MoEFeedForward":
+                                    sc = getattr(m, "_moe_scope", None)
+                                    t = float(getattr(m, "_router_temperature", 1.0))
+                                    j = float(getattr(m, "_router_noise_std", 0.0))
+                                    if sc == "text":
+                                        T_text.append(t); J_text.append(j)
+                                    elif sc == "vision":
+                                        T_vis.append(t); J_vis.append(j)
                             aux_proj = float(self.model.projector.aux_loss().detach().cpu())
                             # Estimate projector router entropy
                             ent_vals = []
@@ -350,8 +555,26 @@ class CurriculumTrainer:
                             moe_ratio = (moe_ms / step_ms) if step_ms > 0 else 0.0
                             a2a_ms, a2a_calls = get_all_to_all_stats()
                             a2a_ratio = (a2a_ms / step_ms) if step_ms > 0 else 0.0
+                            # Aggregate EP dispatcher micro-timings
+                            ep_tok = ep_meta = ep_w = ep_local = 0.0
+                            for mod in self.model.modules():
+                                disp = None
+                                if hasattr(mod, "dispatcher"):
+                                    disp = getattr(mod, "dispatcher")
+                                if hasattr(mod, "_ec_dispatcher") and disp is None:
+                                    disp = getattr(mod, "_ec_dispatcher")
+                                if disp is not None and getattr(disp, "profile_enabled", False):
+                                    ep_tok += float(getattr(disp, "last_ms_tokens", 0.0))
+                                    ep_meta += float(getattr(disp, "last_ms_meta", 0.0))
+                                    ep_w += float(getattr(disp, "last_ms_weights", 0.0))
+                                    ep_local += float(getattr(disp, "last_ms_local", 0.0))
+                            # Compute avg temps/jitter
+                            Tt = sum(T_text)/len(T_text) if T_text else 0.0
+                            Tz = sum(T_vis)/len(T_vis) if T_vis else 0.0
+                            Jt = sum(J_text)/len(J_text) if J_text else 0.0
+                            Jz = sum(J_vis)/len(J_vis) if J_vis else 0.0
                             print(
-                                "  aux(text)={:.6f} aux(vision)={:.6f} aux(projector)={:.6f} ent(projector)={:.6f} drop(text)={:.6f} drop(vision)={:.6f} moe_ms={:.3f} step_ms={:.3f} moe_ratio={:.3f} a2a_ms={:.3f} a2a_ratio={:.3f} a2a_calls={:.0f}".format(
+                                "  aux(text)={:.6f} aux(vision)={:.6f} aux(projector)={:.6f} ent(projector)={:.6f} drop(text)={:.6f} drop(vision)={:.6f} moe_ms={:.3f} step_ms={:.3f} moe_ratio={:.3f} a2a_ms={:.3f} a2a_ratio={:.3f} a2a_calls={:.0f} EP(tok/ms)={:.3f} EP(meta/ms)={:.3f} EP(w/ms)={:.3f} EP(local/ms)={:.3f} Tproj={:.3f} Jproj={:.3f} Ttext={:.3f} Jtext={:.3f} Tvis={:.3f} Jvis={:.3f}".format(
                                     aux_text,
                                     aux_vis,
                                     aux_proj,
@@ -364,6 +587,8 @@ class CurriculumTrainer:
                                     a2a_ms,
                                     a2a_ratio,
                                     a2a_calls,
+                                    ep_tok, ep_meta, ep_w, ep_local,
+                                    float(proj_T), float(proj_J), Tt, Jt, Tz, Jz,
                                 )
                             )
                             # TensorBoard scalars
@@ -381,6 +606,16 @@ class CurriculumTrainer:
                                 self.tb_writer.add_scalar(f"{stage}/a2a_ms", a2a_ms, global_step)
                                 self.tb_writer.add_scalar(f"{stage}/a2a_ratio", a2a_ratio, global_step)
                                 self.tb_writer.add_scalar(f"{stage}/a2a_calls", a2a_calls, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/ep_tok_ms", ep_tok, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/ep_meta_ms", ep_meta, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/ep_w_ms", ep_w, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/ep_local_ms", ep_local, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_T_projector", float(proj_T), global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_J_projector", float(proj_J), global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_T_text", Tt, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_J_text", Jt, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_T_vision", Tz, global_step)
+                                self.tb_writer.add_scalar(f"{stage}/router_J_vision", Jz, global_step)
                     # Periodic evaluation
                     self._maybe_eval(stage, global_step, stage_dir)
                     if global_step % self.hyperparams.get("global", {}).get("save_steps", 1000) == 0:
@@ -390,6 +625,9 @@ class CurriculumTrainer:
                             self.model_engine.save_checkpoint(ckpt_path)
                             # export HF snapshot too
                             save_hf_checkpoint(self.model_engine, self.tokenizer, f"{ckpt_path}-hf")
+                            # write metadata sidecar
+                            meta = self._collect_metadata_snapshot(stage, global_step)
+                            self._write_meta(ckpt_path, meta)
                     if global_step >= total_steps:
                         break
                 if global_step >= total_steps:
@@ -399,18 +637,19 @@ class CurriculumTrainer:
                 ensure_dir(final_path)
                 self.model_engine.save_checkpoint(final_path)
                 save_hf_checkpoint(self.model_engine, self.tokenizer, f"{final_path}-hf")
+                meta = self._collect_metadata_snapshot(stage, global_step)
+                self._write_meta(final_path, meta)
 
         if deepspeed.comm.get_rank() == 0:
             final_dir = f"{self.output_dir}/final"
             ensure_dir(final_dir)
             self.model_engine.save_checkpoint(final_dir)
             save_hf_checkpoint(self.model_engine, self.tokenizer, f"{final_dir}-hf")
+            meta = self._collect_metadata_snapshot("final", global_step)
+            self._write_meta(final_dir, meta)
         # Close TB writer
-        try:
-            if getattr(self, "tb_writer", None) is not None:
-                self.tb_writer.flush(); self.tb_writer.close()
-        except Exception as e:
-            print(f"[Trainer][WARN] Failed to close TensorBoard writer: {e}")
+        if getattr(self, "tb_writer", None) is not None:
+            self.tb_writer.flush(); self.tb_writer.close()
 
 
 __all__ = ["CurriculumTrainer"]

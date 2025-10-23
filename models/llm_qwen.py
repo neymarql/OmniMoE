@@ -31,22 +31,10 @@ class QwenMoELLM(nn.Module):
     ) -> None:
         super().__init__()
         self.attn_implementation = attn_implementation
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name_or_path,
-                attn_implementation=attn_implementation,
-            )
-        except Exception as err:
-            if attn_implementation == "flash_attention_3":
-                print(f"[QwenMoELLM][WARN] flash_attention_3 unavailable ({err}); falling back to flash_attention_2")
-                self.attn_implementation = "flash_attention_2"
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name_or_path,
-                    attn_implementation="flash_attention_2",
-                )
-            else:
-                print(f"[QwenMoELLM][ERROR] Failed to load model with attention={attn_implementation}: {err}")
-                raise
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            attn_implementation=attn_implementation,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
@@ -104,6 +92,17 @@ class QwenMoELLM(nn.Module):
 
     def forward(self, *args, **kwargs):  # noqa: D401
         return self.model(*args, **kwargs)
+
+    # Propagate router temperature/jitter to injected MoE layers (if applicable)
+    def set_router_temperature(self, temperature: float) -> None:
+        for m in self.model.modules():
+            if isinstance(m, MoEFeedForward):
+                m.set_router_temperature(temperature)
+
+    def set_router_jitter(self, std: float) -> None:
+        for m in self.model.modules():
+            if isinstance(m, MoEFeedForward):
+                m.set_router_jitter(std)
 
 
 __all__ = ["QwenMoELLM"]

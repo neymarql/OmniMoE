@@ -55,16 +55,10 @@ def build_optimizer(
     if name == "adam":
         return torch.optim.Adam(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=weight_decay)
     if name == "muon":
-        try:
-            # Placeholder import; if muon is available, use it, otherwise fallback
-            import muon  # type: ignore
-
-            return muon.Muon(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        except Exception:
-            return torch.optim.AdamW(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        import muon  # type: ignore
+        return muon.Muon(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=weight_decay)
     # Default fallback
     return torch.optim.AdamW(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
 
 __all__ = ["build_optimizer"]
-

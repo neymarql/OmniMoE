@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hyperparams", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--resume_from", type=str, default="")
+    parser.add_argument("--seed", type=int, default=3407, help="Random seed (overrides YAML global.seed)")
     return parser.parse_args()
 
 
@@ -29,6 +30,9 @@ def main() -> None:
     dataset_cfg = load_json(args.dataset_config)
     ds_cfg = load_json(args.deepspeed_config)
     hyperparams = load_yaml(args.hyperparams)
+    # Override seed if provided via CLI
+    hyperparams.setdefault("global", {})
+    hyperparams["global"]["seed"] = int(args.seed)
 
     config = OmniMoEConfig(**model_cfg)
     ensure_dir(args.output_dir)

@@ -60,11 +60,8 @@ def save_hf_checkpoint(model_engine, tokenizer, output_dir: str) -> None:
     """
     ensure_dir(output_dir)
     # Only rank 0 writes to disk
-    try:
-        import deepspeed
-        is_rank0 = (deepspeed.comm.get_rank() == 0)
-    except Exception:
-        is_rank0 = True
+    import deepspeed
+    is_rank0 = (deepspeed.comm.get_rank() == 0)
     if not is_rank0:
         return
     model = model_engine.module
@@ -109,14 +106,11 @@ def enable_all_to_all_monitor() -> None:
         return
     if not dist.is_available():
         return
-    try:
-        _ALL_TO_ALL_MONITOR["orig_single"] = dist.all_to_all_single
-        _ALL_TO_ALL_MONITOR["orig_all"] = dist.all_to_all
-        dist.all_to_all_single = _wrap_all_to_all(dist.all_to_all_single)
-        dist.all_to_all = _wrap_all_to_all(dist.all_to_all)
-        _ALL_TO_ALL_MONITOR["enabled"] = True
-    except Exception as err:
-        print(f"[Utils][WARN] Failed to enable all-to-all monitor: {err}")
+    _ALL_TO_ALL_MONITOR["orig_single"] = dist.all_to_all_single
+    _ALL_TO_ALL_MONITOR["orig_all"] = dist.all_to_all
+    dist.all_to_all_single = _wrap_all_to_all(dist.all_to_all_single)
+    dist.all_to_all = _wrap_all_to_all(dist.all_to_all)
+    _ALL_TO_ALL_MONITOR["enabled"] = True
 
 
 def get_all_to_all_stats(reset: bool = True) -> Tuple[float, int]:

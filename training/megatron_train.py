@@ -57,14 +57,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    try:
-        import megatron.core as mcore  # type: ignore
-        from megatron.core import parallel_state as mps  # type: ignore
-        from megatron.core.models.gpt.gpt_model import GPTModel  # type: ignore
-        from megatron.core.transformer.moe.moe_layer import MoEConfig  # type: ignore
-    except Exception as e:
-        print("[Megatron][ERROR] megatron-core not available. Please install megatron-core>=0.14.", e, file=sys.stderr)
-        raise
+    import megatron.core as mcore  # type: ignore
+    from megatron.core import parallel_state as mps  # type: ignore
+    from megatron.core.models.gpt.gpt_model import GPTModel  # type: ignore
+    from megatron.core.transformer.moe.moe_layer import MoEConfig  # type: ignore
 
     args = parse_args()
     args.use_flash_attn_3 = not args.disable_flash_attn_3
@@ -78,8 +74,7 @@ def main() -> None:
     )
 
     # FlashAttention-3 toggle (implementation may vary by version)
-    if args.use_flash_attn_3:
-        os.environ["FLASH_ATTENTION_VERSION"] = "3"
+    # No environment assignment; rely on library defaults or CLI flags.
 
     # Configure MoE
     moe_cfg = MoEConfig(
@@ -118,21 +113,14 @@ def main() -> None:
 
     # Dataset: text-only adapter for our JSON format (optional)
     writer = None
-    try:
-        if mps.get_data_parallel_rank() == 0:
-            writer = SummaryWriter(log_dir=os.path.join(args.save, "runs"))
-    except Exception as e:
-        print("[Megatron][WARN] TensorBoard unavailable:", e)
+    if mps.get_data_parallel_rank() == 0:
+        writer = SummaryWriter(log_dir=os.path.join(args.save, "runs"))
 
     if args.json_path:
-        try:
-            ds = JsonTextOnlyDataset(args.json_path, tokenizer_name=args.tokenizer_name, max_length=4096)
-            dl = DataLoader(ds, batch_size=args.micro_batch_size, shuffle=True, num_workers=2, collate_fn=collate_text_only)
-            data_iter = iter(dl)
-            print(f"[Megatron] Using JSON dataset: {args.json_path}")
-        except Exception as e:
-            print(f"[Megatron][ERROR] Failed to build dataset from {args.json_path}:", e)
-            raise
+        ds = JsonTextOnlyDataset(args.json_path, tokenizer_name=args.tokenizer_name, max_length=4096)
+        dl = DataLoader(ds, batch_size=args.micro_batch_size, shuffle=True, num_workers=2, collate_fn=collate_text_only)
+        data_iter = iter(dl)
+        print(f"[Megatron] Using JSON dataset: {args.json_path}")
     else:
         print("[Megatron] No json_path provided; falling back to dummy random tokens.")
         data_iter = None
@@ -140,40 +128,26 @@ def main() -> None:
     global_rank = mps.get_data_parallel_rank()
     for step in range(args.train_iters):
         if data_iter is not None:
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dl)
-                batch = next(data_iter)
+            batch = next(data_iter)
             tokens = batch["input_ids"].cuda()
             attn = batch["attention_mask"].cuda()
         else:
             tokens = torch.randint(0, 32000, (args.micro_batch_size, seq_len), device="cuda")
             attn = torch.ones_like(tokens)
-        try:
-            loss = model(tokens, attention_mask=attn)[0]
-        except Exception as e:
-            print(f"[Megatron][ERROR] Forward failure at step {step}:", e)
-            raise
+        loss = model(tokens, attention_mask=attn)[0]
         loss.backward()
         opt.step(); opt.zero_grad()
         if step % 50 == 0 and global_rank == 0:
             val = float(loss.detach().cpu())
             print(f"[Megatron] step {step} loss={val:.6f}")
-            try:
-                if writer is not None:
-                    writer.add_scalar("train/loss", val, step)
-            except Exception as e:
-                print("[Megatron][WARN] TB log failed:", e)
+            if writer is not None:
+                writer.add_scalar("train/loss", val, step)
 
     if global_rank == 0:
         os.makedirs(args.save, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(args.save, "gpt_moe_megatron.pt"))
-        try:
-            if writer is not None:
-                writer.flush(); writer.close()
-        except Exception as e:
-            print("[Megatron][WARN] TB close failed:", e)
+        if writer is not None:
+            writer.flush(); writer.close()
 
 
 if __name__ == "__main__":
