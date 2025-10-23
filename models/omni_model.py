@@ -100,7 +100,9 @@ class OmniMoEModel(PreTrainedModel):
             num_heads=projector_cfg.get("num_heads", 8),
             num_experts=projector_cfg.get("num_experts", 8),
             ec_routing=projector_cfg.get("ec_routing", False),
-            capacity_factor=self.config.router_cfg.get("capacity_factor", 1.25),
+            capacity_factor=projector_cfg.get("capacity_factor", self.config.router_cfg.get("capacity_factor", 1.25)),
+            ep_size=projector_cfg.get("ep_size", 1),
+            top_k=projector_cfg.get("top_k", 2),
         )
         image_token = config.alignment_cfg.get("image_token", "<image>")
         if image_token not in self.tokenizer.get_vocab():

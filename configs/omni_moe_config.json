@@ -9,7 +9,10 @@
     "num_heads": 16,
     "num_experts": 8,
     "hidden_size": 4096,
-    "ec_routing": false
+    "ec_routing": false,
+    "ep_size": 1,
+    "top_k": 2,
+    "capacity_factor": 1.25
   },
   "text_moe": {
     "num_experts": 16,

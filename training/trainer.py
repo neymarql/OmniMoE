@@ -74,6 +74,8 @@ class CurriculumTrainer:
         except Exception as e:
             print(f"[Trainer][ERROR] Failed to load checkpoint '{resume_from}': {e}")
             raise
+        if deepspeed.comm.get_rank() == 0:
+            self._log_param_summary()
         self.curriculum_order: List[str] = list(hyperparams.get("curriculum", {}).get("order", []))
         if not self.curriculum_order:
             self.curriculum_order = sorted(dataset_cfg.keys())
@@ -95,6 +97,37 @@ class CurriculumTrainer:
             self._step_end_event = None
         self._last_step_ms = 0.0
         enable_all_to_all_monitor()
+
+    def _log_param_summary(self) -> None:
+        total_params = 0
+        trainable_params = 0
+        per_prefix: Dict[str, Dict[str, float]] = {}
+        preview = []
+        for name, param in self.model.named_parameters():
+            count = param.numel()
+            total_params += count
+            if param.requires_grad:
+                trainable_params += count
+            prefix = name.split(".")[0]
+            stats = per_prefix.setdefault(prefix, {"total": 0, "trainable": 0})
+            stats["total"] += count
+            if param.requires_grad:
+                stats["trainable"] += count
+            if len(preview) < 25:
+                preview.append((name, count, param.requires_grad))
+
+        def fmt(num: float) -> str:
+            return f"{num/1e6:.3f}M"
+
+        print(f"[Params] Total parameters: {total_params} ({fmt(total_params)})")
+        print(f"[Params] Trainable parameters: {trainable_params} ({fmt(trainable_params)})")
+        for prefix, stats in per_prefix.items():
+            print(
+                f"  - {prefix:<15} total={stats['total']} ({fmt(stats['total'])}), trainable={stats['trainable']} ({fmt(stats['trainable'])})"
+            )
+        print("[Params] Preview of first 25 parameter tensors:")
+        for name, count, req_grad in preview:
+            print(f"    {name}: numel={count}, requires_grad={req_grad}")
 
     def _build_dataloader(self, stage: str) -> DataLoader:
         stage_cfg = self.dataset_cfg[stage]

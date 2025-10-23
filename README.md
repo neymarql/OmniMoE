@@ -22,7 +22,7 @@ Below is a sanity‑check + upgrade of your blueprint to be correct and current 
 
 6. Routing/load‑balance: The Switch Transformer auxiliary loss (importance × load) and Noisy Top‑k remain the robust defaults; Expert‑Choice routing (EC) is a modern alternative used in some recent MoE lines (e.g., DeepSeek V2‑series). Start with Top‑2 + Switch aux loss unless you need EC’s properties. You can toggle EC per branch via `text_moe.use_expert_choice_router` / `vision_moe.use_expert_choice_router`, which activates the expert-driven dispatcher with capacity-aware token selection, balanced importance/load EMA, and zero-drop fallback. ([arXiv][7])
 
-7. Optional accelerators: Tutel (Microsoft) remains a drop‑in MoE optimization, and MegaBlocks / “dropless” routing variants exist if you need zero‑drop or better tail behavior (set `router.use_megablocks_dropless: true` **only after** installing MegaBlocks ≥0.7.0 on every node, e.g. `pip install megablocks`).
+7. Optional accelerators: Tutel (Microsoft) remains a drop‑in MoE optimization, and MegaBlocks / “dropless” routing variants exist if you need zero‑drop or better tail behavior (set `router.use_megablocks_dropless: true` **only after** installing MegaBlocks ≥0.7.0 on every node, e.g. `pip install megablocks`). Projector experts can also be sharded across expert-parallel groups via `projector.ep_size` (ensure `num_experts % ep_size == 0`); in this mode, the dispatcher performs top-k routing (default `projector.top_k=2`) and exchanges tokens/results with precise A2A telemetry so you can monitor projector load.
 
 Everything else in your blueprint is directionally correct.
 
