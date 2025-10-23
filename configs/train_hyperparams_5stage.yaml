@@ -1,0 +1,101 @@
+bootstrap:
+  epochs: 1
+  learning_rate: 3.0e-04
+  warmup_steps: 300
+  max_steps: 3000
+  # Freeze all backbones; train projector bridge primarily (MoE kept light if present)
+  freeze:
+    llm: ["all"]
+    vision: ["all"]
+    projector: []
+  projector_layers: 2
+  # Router schedules (will apply even if some MoE backends ignore them)
+  router_temperature_projector: { start: 1.6, end: 1.2, steps: 3000 }
+  router_jitter_projector: { start: 0.02, end: 0.015, steps: 3000 }
+
+stage1:
+  epochs: 1
+  learning_rate: 2.0e-04
+  warmup_steps: 500
+  max_steps: 8000
+  # Only projector MoE on; others frozen
+  freeze:
+    llm: ["all"]
+    vision: ["all"]
+    projector: []
+  projector_layers: 2
+  router_temperature_projector: { start: 1.5, end: 1.1, steps: 8000 }
+  router_jitter_projector: { start: 0.02, end: 0.01, steps: 8000 }
+
+stage2:
+  epochs: 1
+  learning_rate: 1.0e-04
+  warmup_steps: 1000
+  max_steps: 20000
+  # Enable Vision MoE only (vision back-K MoE trainable); keep LLM mostly dense
+  freeze:
+    llm: ["bottom_24"]
+    vision: ["all_but_moe"]
+    projector: []
+  projector_layers: 3
+  router_temperature_projector: { start: 1.2, end: 1.1, steps: 20000 }
+  router_temperature_vision:    { start: 1.2, end: 1.0, steps: 20000 }
+  router_jitter_projector: 0.01
+  router_jitter_vision:    { start: 0.01, end: 0.0, steps: 20000 }
+
+stage3:
+  epochs: 1
+  learning_rate: 7.5e-05
+  warmup_steps: 1000
+  max_steps: 15000
+  # Start enabling some LLM MoE (top layers or specified moe_layers)
+  freeze:
+    llm: []          # or ["top_12"] depending on target
+    vision: ["all_but_moe"]
+    projector: []
+  projector_layers: 3
+  router_temperature_projector: { start: 1.1, end: 1.0, steps: 15000 }
+  router_temperature_vision:    { start: 1.1, end: 1.0, steps: 15000 }
+  router_temperature_llm:       { start: 1.1, end: 1.0, steps: 15000 }
+  router_jitter_projector: 0.0
+  router_jitter_vision:    0.0
+  router_jitter_llm:       0.0
+
+stage4:
+  epochs: 1
+  learning_rate: 3.0e-05
+  warmup_steps: 500
+  max_steps: 8000
+  # Joint full fine-tuning (all open)
+  freeze:
+    llm: []
+    vision: []
+    projector: []
+  projector_layers: 4
+  router_temperature_projector: { start: 1.0, end: 1.0, steps: 8000 }
+  router_temperature_vision:    { start: 1.0, end: 1.0, steps: 8000 }
+  router_temperature_llm:       { start: 1.0, end: 1.0, steps: 8000 }
+  router_jitter_projector: 0.0
+  router_jitter_vision:    0.0
+  router_jitter_llm:       0.0
+
+curriculum:
+  order: ["bootstrap", "stage1", "stage2", "stage3", "stage4"]
+  eval_interval_steps: 2000
+  checkpoint_interval_steps: 1000
+  gradient_accumulation_steps: 8
+  global_batch_tokens: 1048576
+
+global:
+  weight_decay: 0.1
+  grad_clip: 1.0
+  logging_steps: 50
+  save_steps: 1000
+  eval_batch_size: 4
+  train_batch_size_per_gpu: 2
+  seed: 3407
+  dispatch_profile: false
+  use_flash_attention: true
+  gradient_checkpointing: true
+  resume_from: ""
+  output_dir: "/mnt/checkpoints/omni_stack_moe_5stage"
